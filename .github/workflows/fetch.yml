@@ -9,9 +9,12 @@ on:
       months:
         description: "Months YYYY-MM separated by space"
         default: "2025-03"
+      market:
+        description: "Market path on data.binance.vision: futures/um (USDT-M futures) or spot"
+        default: "futures/um"
       tag:
-        description: "Release tag to upload to"
-        default: "data-test"
+        description: "Release tag to upload to (empty = market name, e.g. futures-um)"
+        default: ""
 
 permissions:
   contents: write
@@ -31,13 +34,14 @@ jobs:
         env:
           SYMBOLS: ${{ inputs.symbols }}
           MONTHS: ${{ inputs.months }}
+          MARKET: ${{ inputs.market }}
         run: |
           set -euo pipefail
           mkdir -p dl out
           for S in $SYMBOLS; do
             for M in $MONTHS; do
               F="$S-1m-$M.zip"
-              U="https://data.binance.vision/data/spot/monthly/klines/$S/1m/$F"
+              U="https://data.binance.vision/data/$MARKET/monthly/klines/$S/1m/$F"
               echo "=== $F"
               curl -fsSL --retry 3 -o "dl/$F" "$U"
               curl -fsSL --retry 3 -o "dl/$F.CHECKSUM" "$U.CHECKSUM"
@@ -54,7 +58,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          MARKET: ${{ inputs.market }}
         run: |
           set -euo pipefail
+          if [ -z "$TAG" ]; then TAG="${MARKET//\//-}"; fi
+          echo "release tag: $TAG"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Packed Binance 1m klines (.cpk, lossless, see candle_pack.py)"
           gh release upload "$TAG" out/*.cpk --clobber
