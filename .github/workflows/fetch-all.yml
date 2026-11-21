@@ -1,5 +1,6 @@
 name: fetch-all-futures
 
+# Releases: <tag>-active (still trading) and <tag>-delisted (history ends before the last full month); each has INDEX.csv listing every symbol.
 # mode=plan : only counts symbols/files (downloads nothing). mode=run : download from Binance, pack, upload to Releases.
 on:
   workflow_dispatch:
@@ -181,9 +182,15 @@ jobs:
               with ThreadPoolExecutor(12) as ex:
                   res = list(ex.map(months_of, syms))
               items = []
-              for i, (sym, ms) in enumerate(res):
+              for sym, ms in res:
                   if ms:
-                      items.append({"sym": sym, "months": ms, "tag": f"{TAG_BASE}-{i // PER_RELEASE + 1}" if len(syms) > PER_RELEASE else TAG_BASE})
+                      st = "active" if ms[-1] == end else "delisted"     # active = has the last full month; otherwise its history ended earlier
+                      items.append({"sym": sym, "months": ms, "status": st, "tag": f"{TAG_BASE}-{st}"})
+              for st in ("active", "delisted"):                           # more than 900 in one category -> split into -2, -3 ...
+                  grp = [it for it in items if it["status"] == st]
+                  if len(grp) > PER_RELEASE:
+                      for k, it in enumerate(grp):
+                          it["tag"] = f"{TAG_BASE}-{st}-{k // PER_RELEASE + 1}"
               tags = sorted(set(it["tag"] for it in items))
               have = {}
               if not FORCE:
@@ -191,7 +198,8 @@ jobs:
                       have[t] = existing_assets(t)
               todo = [it for it in items if f"{it['sym']}-1m.cpk" not in have.get(it["tag"], set())]
               nfiles = sum(len(it["months"]) for it in todo)
-              print(f"symbols with data: {len(items)} | already in release: {len(items) - len(todo)} | to do: {len(todo)} symbols, {nfiles} monthly files")
+              n_act = sum(1 for it in items if it["status"] == "active")
+              print(f"symbols with data: {len(items)} (active {n_act}, delisted {len(items) - n_act}) | already in release: {len(items) - len(todo)} | to do: {len(todo)} symbols, {nfiles} monthly files")
               n = max(1, min(SHARDS, len(todo)))
               shards = [[] for _ in range(n)]
               load = [0] * n
@@ -200,6 +208,9 @@ jobs:
                   shards[j].append(it)
                   load[j] += len(it["months"])
               print("shard loads (monthly files):", load)
+              for j, sh in enumerate(shards):
+                  for it in sh:
+                      it["shard"] = j
               os.makedirs("plan", exist_ok=True)
               json.dump({"market": MARKET, "shards": shards}, open("plan/plan.json", "w"))
               if RUN:
@@ -215,7 +226,10 @@ jobs:
               summ = os.environ.get("GITHUB_STEP_SUMMARY")
               if summ:
                   with open(summ, "a") as f:
-                      f.write(f"### Plan ({'RUN' if RUN else 'DRY'})\n- symbols in listing: {allsyms}, matching: {len(syms)}\n- to do: {len(todo)} symbols, {nfiles} monthly files, {n} shards\n- months {START}..{end}\n")
+                      f.write(f"### Plan ({'RUN' if RUN else 'DRY'})\n- symbols in listing: {allsyms}, matching: {len(syms)}\n- active: {n_act}, delisted: {len(items) - n_act}\n- to do: {len(todo)} symbols, {nfiles} monthly files, {n} shards\n- months {START}..{end}\n")
+                      f.write("\n### Which symbols are in which shard\n")
+                      for j, sh in enumerate(shards):
+                          f.write(f"- shard {j} ({sum(len(x['months']) for x in sh)} files): " + " ".join(f"{x['sym']}[{x['status'][0]}]" for x in sh) + "\n")
               if not RUN:
                   print("DRY RUN: nothing downloaded. Re-run with mode=run to start.")
 
@@ -263,6 +277,7 @@ jobs:
           SHARD = int(os.environ["SHARD"])
           GH = os.environ.get("GH_BIN", "gh")
           PY = sys.executable
+          ROWS = []
 
 
           def get(url, tries=6):
@@ -307,6 +322,8 @@ jobs:
               rc, txt2 = run([PY, "candle_pack.py", "verify", d, dst])
               if rc != 0 or "IDENTICAL" not in txt2:
                   raise RuntimeError("verify failed: " + txt2[-300:])
+              m = re.search(r"OK\s+([\d,]+) rows", txt)
+              nrows = int(m.group(1).replace(",", "")) if m else -1
               sz = os.path.getsize(dst)
               sha = hashlib.sha256(open(dst, "rb").read()).hexdigest()
               rc, txt3 = run([GH, "release", "upload", tag, dst, "--clobber"])
@@ -314,7 +331,9 @@ jobs:
                   raise RuntimeError("upload failed: " + txt3[-300:])
               shutil.rmtree(d, ignore_errors=True)
               os.remove(dst)
-              return f"{sym}: {len(months)} months, {sz / 1e6:.1f} MB, sha256 {sha[:16]}..., first {months[0]} last {months[-1]}"
+              ROWS.append({"symbol": sym, "status": it["status"], "tag": tag, "shard": SHARD, "first_month": months[0], "last_month": months[-1],
+                           "months": len(months), "rows": nrows, "size_mb": round(sz / 1e6, 2), "sha256": sha, "file": f"{sym}-1m.cpk"})
+              return f"{sym} [{it['status']}]: {len(months)} months, {nrows:,} rows, {sz / 1e6:.1f} MB, sha256 {sha[:16]}..., {months[0]}..{months[-1]}"
 
 
           def main():
@@ -330,6 +349,7 @@ jobs:
                   except Exception as e:
                       print(f"[{k}/{len(items)}] FAIL {it['sym']}: {e}", flush=True)
                       bad.append(it["sym"])
+              json.dump(ROWS, open(f"rows_{SHARD}.json", "w"))
               print(f"shard {SHARD} done in {(time.time() - t0) / 60:.1f} min; failed: {bad}")
               if bad:
                   sys.exit(1)
@@ -338,3 +358,62 @@ jobs:
           main()
           PYEOF
           python shard.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rows-${{ matrix.shard }}
+          path: rows_${{ matrix.shard }}.json
+          if-no-files-found: ignore
+
+  index:
+    needs: [plan, shard]
+    if: always() && needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rows-*
+          path: rows
+      - name: Build INDEX.csv per release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cat > index.py <<'PYEOF'
+          import os, sys, csv, glob, json, subprocess, shutil
+
+          GH = os.environ.get("GH_BIN", "gh")
+          COLS = ["symbol", "status", "tag", "shard", "first_month", "last_month", "months", "rows", "size_mb", "sha256", "file"]
+          rows = []
+          for f in glob.glob("rows/**/rows_*.json", recursive=True):
+              rows += json.load(open(f))
+          print(f"rows from this run: {len(rows)}")
+          by_tag = {}
+          for r in rows:
+              by_tag.setdefault(r["tag"], {})[r["symbol"]] = r
+          for tag, new in sorted(by_tag.items()):
+              d = os.path.join("old", tag)
+              shutil.rmtree(d, ignore_errors=True)
+              os.makedirs(d)
+              old = {}
+              rc = subprocess.run([GH, "release", "download", tag, "-p", "INDEX.csv", "-D", d, "--clobber"], capture_output=True).returncode
+              p = os.path.join(d, "INDEX.csv")
+              if rc == 0 and os.path.exists(p):
+                  for r in csv.DictReader(open(p, encoding="utf-8")):
+                      old[r["symbol"]] = r
+              for sym, r in new.items():
+                  old[sym] = {c: r.get(c, "") for c in COLS}
+              out = f"INDEX_{tag}.csv"
+              with open(out, "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=COLS)
+                  w.writeheader()
+                  for sym in sorted(old):
+                      w.writerow(old[sym])
+              shutil.copy(out, "INDEX.csv")
+              r = subprocess.run([GH, "release", "upload", tag, "INDEX.csv", "--clobber"], capture_output=True, text=True)
+              print(f"{tag}: {len(old)} symbols in INDEX.csv ({len(new)} new/updated)", "OK" if r.returncode == 0 else "UPLOAD FAILED " + r.stderr[:200])
+              if r.returncode != 0:
+                  sys.exit(1)
+          PYEOF
+          python3 index.py
