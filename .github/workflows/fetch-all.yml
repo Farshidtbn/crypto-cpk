@@ -1,8 +1,12 @@
 name: fetch-all-futures
 
+# Also runs by itself on the 5th and 9th of every month (06:00 UTC; the 9th only does something if the 5th found last month not yet published): update mode = add last month to every coin, move newly delisted coins, add newly listed coins.
+
 # Releases: <tag>-active (still trading) and <tag>-delisted (history ends before the last full month); each has INDEX.csv listing every symbol.
 # mode=plan : only counts symbols/files (downloads nothing). mode=run : download from Binance, pack, upload to Releases.
 on:
+  schedule:
+    - cron: "0 6 5,9 * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -30,6 +34,14 @@ on:
       limit_symbols:
         description: "Test: only the first N symbols (0 = all)"
         default: "0"
+      update:
+        description: "true = monthly update (append new months, move delisted, add new coins); false = first-time download"
+        type: boolean
+        default: false
+      allow_many_moves:
+        description: "Only if many coins really were delisted at once (the safety stop refuses by default)"
+        type: boolean
+        default: false
       force:
         description: "Re-do symbols that already exist in the release"
         type: boolean
@@ -55,15 +67,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           REPO: ${{ github.repository }}
-          MODE: ${{ inputs.mode }}
-          START: ${{ inputs.start }}
+          MODE: ${{ inputs.mode || 'run' }}
+          START: ${{ inputs.start || '2020-01' }}
           END: ${{ inputs.end }}
-          MARKET: ${{ inputs.market }}
-          SYMBOL_REGEX: ${{ inputs.symbol_regex }}
-          SHARDS: ${{ inputs.shards }}
-          LIMIT_SYMBOLS: ${{ inputs.limit_symbols }}
-          FORCE: ${{ inputs.force }}
-          TAG_BASE: ${{ inputs.tag }}
+          MARKET: ${{ inputs.market || 'futures/um' }}
+          SYMBOL_REGEX: ${{ inputs.symbol_regex || '^[A-Z0-9]+USDT$' }}
+          SHARDS: ${{ inputs.shards || '20' }}
+          LIMIT_SYMBOLS: ${{ inputs.limit_symbols || '0' }}
+          FORCE: ${{ inputs.force || 'false' }}
+          ALLOW_MANY_MOVES: ${{ inputs.allow_many_moves || 'false' }}
+          UPDATE: ${{ github.event_name == 'schedule' && 'true' || inputs.update }}
+          TAG_BASE: ${{ inputs.tag || 'futures-um-1m' }}
         run: |
           cat > plan.py <<'PYEOF'
           import os, re, sys, json, time, datetime, subprocess, urllib.request, urllib.parse
@@ -80,9 +94,11 @@ jobs:
           FORCE = os.environ.get("FORCE", "false").lower() == "true"
           LIMIT = int(os.environ.get("LIMIT_SYMBOLS", "0") or 0)
           RUN = os.environ.get("MODE", "plan") == "run"
+          UPDATE = os.environ.get("UPDATE", "false").lower() == "true"
           GH = os.environ.get("GH_BIN", "gh")
           REPO = os.environ.get("REPO", "")
-          PER_RELEASE = 900
+          PER_RELEASE = int(os.environ.get("PER_RELEASE", "900"))
+          ALLOW_MANY = os.environ.get("ALLOW_MANY_MOVES", "false").lower() == "true"
           BASE = f"data/{MARKET}/monthly/klines/"
 
 
@@ -157,6 +173,33 @@ jobs:
               return set(x.strip() for x in r.stdout.splitlines() if x.strip())
 
 
+          def release_tags(base):
+              """all releases of one category: <base> , <base>-2, <base>-3 ..."""
+              r = gh("api", "--paginate", f"repos/{REPO}/releases?per_page=100", "--jq", ".[].tag_name", check=False)
+              out = set()
+              for t in (r.stdout or "").split():
+                  if t == base or re.fullmatch(re.escape(base) + r"-\d+", t):
+                      out.add(t)
+              out.add(base)
+              return sorted(out)
+
+
+          def load_state(tags):
+              """symbol -> row of INDEX.csv (+ where it lives now), read from the INDEX.csv of the releases"""
+              import csv, tempfile
+              st = {}
+              for t in tags:
+                  d = tempfile.mkdtemp()
+                  if gh("release", "download", t, "-p", "INDEX.csv", "-D", d, "--clobber", check=False).returncode != 0:
+                      continue
+                  p = os.path.join(d, "INDEX.csv")
+                  if os.path.exists(p):
+                      for r in csv.DictReader(open(p, encoding="utf-8")):
+                          r["cur_tag"] = t
+                          st[r["symbol"]] = r
+              return st
+
+
           def main():
               end = END or prev_month()
               _, pres = s3_list(BASE, "/")
@@ -191,22 +234,87 @@ jobs:
                   if len(grp) > PER_RELEASE:
                       for k, it in enumerate(grp):
                           it["tag"] = f"{TAG_BASE}-{st}-{k // PER_RELEASE + 1}"
-              tags = sorted(set(it["tag"] for it in items))
-              have = {}
-              if not FORCE:
-                  for t in tags:
-                      have[t] = existing_assets(t)
-              todo = [it for it in items if f"{it['sym']}-1m.cpk" not in have.get(it["tag"], set())]
+              tags = sorted(set(it["tag"] for it in items) | {f"{TAG_BASE}-active", f"{TAG_BASE}-delisted"})
+              stats = {"new": 0, "incr": 0, "move": 0}
+              if UPDATE:
+                  cat_tags = {st: release_tags(f"{TAG_BASE}-{st}") for st in ("active", "delisted")}
+                  state = load_state(cat_tags["active"] + cat_tags["delisted"])
+                  count = {}
+                  for s in state.values():
+                      count[s["cur_tag"]] = count.get(s["cur_tag"], 0) + 1
+                  print(f"UPDATE mode: the INDEX.csv files know {len(state)} symbols; assets per release: {count}")
+                  listed = {it["sym"]: it for it in items}
+                  # --- safety 1: is last month really published for (almost) all known active coins? ---
+                  act_known = [s for s in state.values() if "-delisted" not in s["cur_tag"]]
+                  have_end = sum(1 for s in act_known if s["symbol"] in listed and listed[s["symbol"]]["months"][-1] == end)
+                  if act_known and have_end < 0.5 * len(act_known):
+                      print(f"STOP (nothing changed): month {end} is published for only {have_end} of {len(act_known)} known active coins -> Binance has not finished uploading it. Try again later.")
+                      items = []
+                  # --- safety 2: too many coins would be declared delisted at once ---
+                  newly_del = [s for s in act_known if s["symbol"] in listed and listed[s["symbol"]]["status"] == "delisted"]
+                  if len(newly_del) > max(10, 0.05 * len(act_known)) and not ALLOW_MANY:
+                      raise SystemExit(f"STOP: {len(newly_del)} of {len(act_known)} active coins would move to delisted at once (suspicious). Nothing changed. Check data.binance.vision, then run again with allow_many_moves=true if it is real.")
+
+                  def alloc(status):
+                      base = f"{TAG_BASE}-{status}"
+                      n = 1
+                      while True:
+                          t = base if n == 1 else f"{base}-{n}"
+                          if count.get(t, 0) < PER_RELEASE:
+                              count[t] = count.get(t, 0) + 1
+                              return t
+                          n += 1
+
+                  todo = []
+                  flips = [it for it in items if it["sym"] in state and ("-delisted" in state[it["sym"]]["cur_tag"]) != (it["status"] == "delisted")]
+                  for it in flips:                                   # free the old slot first, so a delisted coin can leave a full release
+                      count[state[it["sym"]]["cur_tag"]] -= 1
+                  for it in sorted(items, key=lambda x: x["sym"]):
+                      cur = state.get(it["sym"])
+                      it["all_months"] = it["months"]
+                      if cur is None:
+                          stats["new"] += 1
+                          it["kind"] = "new"
+                          it["tag"] = alloc(it["status"])
+                          todo.append(it)
+                          continue
+                      flipped = it in flips
+                      it["tag"] = alloc(it["status"]) if flipped else cur["cur_tag"]
+                      last = cur["last_month"]
+                      newm = [m for m in it["months"] if m > last]
+                      it["have_tag"] = cur["cur_tag"]
+                      it["old_last"] = last
+                      it["old_first"] = cur["first_month"]
+                      it["old_months"] = int(cur["months"])
+                      if newm:
+                          stats["incr"] += 1
+                          it["kind"] = "incr"
+                          it["months"] = newm
+                          todo.append(it)
+                      elif flipped:
+                          stats["move"] += 1                      # e.g. it was active, Binance has nothing newer -> now delisted
+                          it["kind"] = "move"
+                          it["months"] = []
+                          todo.append(it)
+                  tags = sorted(set(tags) | set(it["tag"] for it in todo))
+                  print(f"UPDATE: new symbols {stats['new']}, symbols with new months {stats['incr']}, only moved {stats['move']}")
+              else:
+                  have = {}
+                  if not FORCE:
+                      for t in tags:
+                          have[t] = existing_assets(t)
+                  todo = [it for it in items if f"{it['sym']}-1m.cpk" not in have.get(it["tag"], set())]
               nfiles = sum(len(it["months"]) for it in todo)
+              tags = sorted(set(tags))
               n_act = sum(1 for it in items if it["status"] == "active")
-              print(f"symbols with data: {len(items)} (active {n_act}, delisted {len(items) - n_act}) | already in release: {len(items) - len(todo)} | to do: {len(todo)} symbols, {nfiles} monthly files")
+              print(f"symbols with data: {len(items)} (active {n_act}, delisted {len(items) - n_act}) | already up to date: {len(items) - len(todo)} | to do: {len(todo)} symbols, {nfiles} monthly files")
               n = max(1, min(SHARDS, len(todo)))
               shards = [[] for _ in range(n)]
               load = [0] * n
               for it in sorted(todo, key=lambda x: -len(x["months"])):
                   j = load.index(min(load))
                   shards[j].append(it)
-                  load[j] += len(it["months"])
+                  load[j] += max(1, len(it["months"]))
               print("shard loads (monthly files):", load)
               for j, sh in enumerate(shards):
                   for it in sh:
@@ -226,7 +334,7 @@ jobs:
               summ = os.environ.get("GITHUB_STEP_SUMMARY")
               if summ:
                   with open(summ, "a") as f:
-                      f.write(f"### Plan ({'RUN' if RUN else 'DRY'})\n- symbols in listing: {allsyms}, matching: {len(syms)}\n- active: {n_act}, delisted: {len(items) - n_act}\n- to do: {len(todo)} symbols, {nfiles} monthly files, {n} shards\n- months {START}..{end}\n")
+                      f.write(f"### Plan ({'RUN' if RUN else 'DRY'})\n- symbols in listing: {allsyms}, matching: {len(syms)}\n- active: {n_act}, delisted: {len(items) - n_act}\n- to do: {len(todo)} symbols, {nfiles} monthly files, {n} shards\n- update stats: {stats if UPDATE else 'off'}\n- months {START}..{end}\n")
                       f.write("\n### Which symbols are in which shard\n")
                       for j, sh in enumerate(shards):
                           f.write(f"- shard {j} ({sum(len(x['months']) for x in sh)} files): " + " ".join(f"{x['sym']}[{x['status'][0]}]" for x in sh) + "\n")
@@ -266,7 +374,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SHARD: ${{ matrix.shard }}
-          MARKET: ${{ inputs.market }}
+          MARKET: ${{ inputs.market || 'futures/um' }}
         run: |
           cat > shard.py <<'PYEOF'
           import os, re, sys, json, time, shutil, hashlib, subprocess, urllib.request
@@ -296,13 +404,23 @@ jobs:
               return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
-          def one(it):
-              sym, months, tag = it["sym"], it["months"], it["tag"]
-              d = os.path.join("w", sym)
-              shutil.rmtree(d, ignore_errors=True)
-              os.makedirs(d)
-              os.makedirs("out", exist_ok=True)
+          def finish(it, sym, tag, dst, nrows, first, last, nmonths, moved_from):
+              sz = os.path.getsize(dst)
+              sha = hashlib.sha256(open(dst, "rb").read()).hexdigest()
+              rc, txt3 = run([GH, "release", "upload", tag, dst, "--clobber"])
+              if rc != 0:
+                  raise RuntimeError("upload failed: " + txt3[-300:])
+              if moved_from and moved_from != tag:                 # the new copy is safely uploaded -> remove the old one from the other release
+                  rc, t4 = run([GH, "release", "delete-asset", moved_from, f"{sym}-1m.cpk", "-y"])
+                  if rc != 0:
+                      print(f"   warning: could not delete old asset {sym} from {moved_from}: {t4[-200:]}", flush=True)
+              ROWS.append({"symbol": sym, "status": it["status"], "tag": tag, "shard": SHARD, "first_month": first, "last_month": last,
+                           "months": nmonths, "rows": nrows, "size_mb": round(sz / 1e6, 2), "sha256": sha, "file": f"{sym}-1m.cpk",
+                           "moved_from": moved_from if moved_from and moved_from != tag else ""})
+              return sz, sha
 
+
+          def download_months(sym, months, d):
               def dl(m):
                   F = f"{sym}-1m-{m}.zip"
                   url = f"{BASE}/data/{MARKET}/monthly/klines/{sym}/1m/{F}"
@@ -312,9 +430,11 @@ jobs:
                       raise RuntimeError(f"checksum mismatch {F}")
                   with open(os.path.join(d, F), "wb") as f:
                       f.write(data)
-
               with ThreadPoolExecutor(4) as ex:
                   list(ex.map(dl, months))
+
+
+          def pack_full(it, sym, months, tag, d, moved_from=""):
               dst = os.path.join("out", f"{sym}-1m.cpk")
               rc, txt = run([PY, "candle_pack.py", "pack", d, dst])
               if rc != 0 or "all 64-bit values verified identical" not in txt:
@@ -324,15 +444,80 @@ jobs:
                   raise RuntimeError("verify failed: " + txt2[-300:])
               m = re.search(r"OK\s+([\d,]+) rows", txt)
               nrows = int(m.group(1).replace(",", "")) if m else -1
-              sz = os.path.getsize(dst)
-              sha = hashlib.sha256(open(dst, "rb").read()).hexdigest()
-              rc, txt3 = run([GH, "release", "upload", tag, dst, "--clobber"])
-              if rc != 0:
-                  raise RuntimeError("upload failed: " + txt3[-300:])
-              shutil.rmtree(d, ignore_errors=True)
+              sz, sha = finish(it, sym, tag, dst, nrows, months[0], months[-1], len(months), moved_from)
               os.remove(dst)
-              ROWS.append({"symbol": sym, "status": it["status"], "tag": tag, "shard": SHARD, "first_month": months[0], "last_month": months[-1],
-                           "months": len(months), "rows": nrows, "size_mb": round(sz / 1e6, 2), "sha256": sha, "file": f"{sym}-1m.cpk"})
+              return nrows, sz, sha
+
+
+          def one(it):
+              sym, months, tag = it["sym"], it["months"], it["tag"]
+              kind = it.get("kind", "new")
+              d = os.path.join("w", sym)
+              shutil.rmtree(d, ignore_errors=True)
+              os.makedirs(d)
+              os.makedirs("out", exist_ok=True)
+              if kind in ("incr", "move"):
+                  have = it["have_tag"]
+                  od = os.path.join("oldcpk", sym)
+                  shutil.rmtree(od, ignore_errors=True)
+                  os.makedirs(od)
+                  rc, txt = run([GH, "release", "download", have, "-p", f"{sym}-1m.cpk", "-D", od, "--clobber"])
+                  oldp = os.path.join(od, f"{sym}-1m.cpk")
+                  if rc != 0 or not os.path.exists(oldp):
+                      print(f"   old file of {sym} not found in {have} -> doing the full download instead", flush=True)
+                      allm = it["all_months"]
+                      download_months(sym, allm, d)
+                      nrows, sz, sha = pack_full(it, sym, allm, tag, d, have)
+                      shutil.rmtree(d, ignore_errors=True)
+                      return f"{sym} [{it['status']}]: FULL redo {len(allm)} months, {nrows:,} rows, {sz / 1e6:.1f} MB"
+                  import numpy as np
+                  import candle_pack as cp
+                  oblob = open(oldp, "rb").read()
+                  on, oc, ou = cp.decode(oblob)
+                  n_old = len(oc[on[0]])
+                  if kind == "move":
+                      sha_old = hashlib.sha256(oblob).hexdigest()
+                      sz, sha = finish(it, sym, tag, oldp, n_old, it["old_first"], it["old_last"], it["old_months"], have)
+                      assert sha == sha_old
+                      shutil.rmtree(od, ignore_errors=True)
+                      return f"{sym}: moved {have} -> {tag} (no new months), {n_old:,} rows"
+                  download_months(sym, months, d)
+                  nn, nc, nu = cp.read_source(d)
+                  n_new = len(nc[nn[0]])
+                  if nn != on or nu != ou:
+                      raise RuntimeError("columns/time unit of the new months differ from the stored file")
+                  mn, mc, mu = cp.concat([(on, oc, ou), (nn, nc, nu)])
+                  n_all = len(mc[mn[0]])
+                  if n_all != n_old + n_new:
+                      raise RuntimeError(f"overlap between old data and new months ({n_old}+{n_new} != {n_all})")
+                  ts_old, ts_new = oc[on[0]], nc[nn[0]]
+                  if not (ts_old.max() < ts_new.min()):
+                      raise RuntimeError("new months are not strictly after the old data")
+                  blob = cp.encode(mn, mc, mu)
+                  n2, c2, u2 = cp.decode(blob)
+                  if n2 != mn or u2 != mu or not cp.same(mc, c2, mn):
+                      raise RuntimeError("verify failed: packed result differs from merged data")
+                  for c in on:                                   # the old part must be bit-identical to what was stored, the new part to the zips
+                      a, b2 = c2[c][:n_old], oc[c]
+                      a, b2 = (a.view(np.int64), b2.view(np.int64)) if a.dtype == np.float64 else (a, b2)
+                      if not np.array_equal(a, b2):
+                          raise RuntimeError("old part changed after merge in column " + c)
+                      a, b2 = c2[c][n_old:], nc[c]
+                      a, b2 = (a.view(np.int64), b2.view(np.int64)) if a.dtype == np.float64 else (a, b2)
+                      if not np.array_equal(a, b2):
+                          raise RuntimeError("new part changed after merge in column " + c)
+                  dst = os.path.join("out", f"{sym}-1m.cpk")
+                  open(dst, "wb").write(blob)
+                  nm = it["old_months"] + len(months)
+                  sz, sha = finish(it, sym, tag, dst, n_all, it["old_first"], months[-1], nm, have)
+                  os.remove(dst)
+                  shutil.rmtree(d, ignore_errors=True)
+                  shutil.rmtree(od, ignore_errors=True)
+                  mv = f", moved {have}->{tag}" if have != tag else ""
+                  return f"{sym} [{it['status']}]: +{len(months)} month(s) ({months[0]}..{months[-1]}), +{n_new:,} rows, total {n_all:,}, {sz / 1e6:.1f} MB{mv}"
+              download_months(sym, months, d)
+              nrows, sz, sha = pack_full(it, sym, months, tag, d)
+              shutil.rmtree(d, ignore_errors=True)
               return f"{sym} [{it['status']}]: {len(months)} months, {nrows:,} rows, {sz / 1e6:.1f} MB, sha256 {sha[:16]}..., {months[0]}..{months[-1]}"
 
 
@@ -389,10 +574,14 @@ jobs:
           for f in glob.glob("rows/**/rows_*.json", recursive=True):
               rows += json.load(open(f))
           print(f"rows from this run: {len(rows)}")
-          by_tag = {}
+          new_by_tag, gone_by_tag = {}, {}
           for r in rows:
-              by_tag.setdefault(r["tag"], {})[r["symbol"]] = r
-          for tag, new in sorted(by_tag.items()):
+              new_by_tag.setdefault(r["tag"], {})[r["symbol"]] = r
+              if r.get("moved_from"):
+                  gone_by_tag.setdefault(r["moved_from"], set()).add(r["symbol"])
+          bad = False
+          for tag in sorted(set(new_by_tag) | set(gone_by_tag)):
+              new, gone = new_by_tag.get(tag, {}), gone_by_tag.get(tag, set())
               d = os.path.join("old", tag)
               shutil.rmtree(d, ignore_errors=True)
               os.makedirs(d)
@@ -402,6 +591,9 @@ jobs:
               if rc == 0 and os.path.exists(p):
                   for r in csv.DictReader(open(p, encoding="utf-8")):
                       old[r["symbol"]] = r
+              for sym in gone:
+                  if sym not in new:
+                      old.pop(sym, None)
               for sym, r in new.items():
                   old[sym] = {c: r.get(c, "") for c in COLS}
               out = f"INDEX_{tag}.csv"
@@ -412,8 +604,26 @@ jobs:
                       w.writerow(old[sym])
               shutil.copy(out, "INDEX.csv")
               r = subprocess.run([GH, "release", "upload", tag, "INDEX.csv", "--clobber"], capture_output=True, text=True)
-              print(f"{tag}: {len(old)} symbols in INDEX.csv ({len(new)} new/updated)", "OK" if r.returncode == 0 else "UPLOAD FAILED " + r.stderr[:200])
-              if r.returncode != 0:
-                  sys.exit(1)
+              print(f"{tag}: {len(old)} symbols in INDEX.csv ({len(new)} new/updated, {len(gone)} moved away)", "OK" if r.returncode == 0 else "UPLOAD FAILED " + r.stderr[:200])
+              bad = bad or r.returncode != 0
+          if bad:
+              sys.exit(1)
           PYEOF
           python3 index.py
+
+  keepalive:
+    # GitHub switches scheduled workflows off after 60 days without activity in the repo -> one tiny commit per run keeps it alive
+    needs: [plan, index]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit a date stamp
+        run: |
+          date -u +"last scheduled run: %Y-%m-%d %H:%M UTC" > keepalive.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add keepalive.txt
+          git commit -m "keepalive $(date -u +%F)" || exit 0
+          git push
