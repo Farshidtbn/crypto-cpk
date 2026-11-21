@@ -1,0 +1,340 @@
+name: fetch-all-futures
+
+# mode=plan : only counts symbols/files (downloads nothing). mode=run : download from Binance, pack, upload to Releases.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "plan = only count (safe, nothing downloaded) | run = download + pack + upload"
+        type: choice
+        options:
+          - plan
+          - run
+        default: plan
+      start:
+        description: "First month YYYY-MM"
+        default: "2020-01"
+      end:
+        description: "Last month YYYY-MM (empty = last full month)"
+        default: ""
+      market:
+        description: "data.binance.vision market path"
+        default: "futures/um"
+      symbol_regex:
+        description: "Symbols to keep (default: USDT perpetuals incl. delisted; excludes quarterly contracts and USDC)"
+        default: "^[A-Z0-9]+USDT$"
+      shards:
+        description: "Number of parallel jobs (max 20 on the free plan)"
+        default: "20"
+      limit_symbols:
+        description: "Test: only the first N symbols (0 = all)"
+        default: "0"
+      force:
+        description: "Re-do symbols that already exist in the release"
+        type: boolean
+        default: false
+      tag:
+        description: "Release tag"
+        default: "futures-um-1m"
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      run: ${{ steps.p.outputs.run }}
+      matrix: ${{ steps.p.outputs.matrix }}
+    steps:
+      - name: Plan
+        id: p
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REPO: ${{ github.repository }}
+          MODE: ${{ inputs.mode }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          MARKET: ${{ inputs.market }}
+          SYMBOL_REGEX: ${{ inputs.symbol_regex }}
+          SHARDS: ${{ inputs.shards }}
+          LIMIT_SYMBOLS: ${{ inputs.limit_symbols }}
+          FORCE: ${{ inputs.force }}
+          TAG_BASE: ${{ inputs.tag }}
+        run: |
+          cat > plan.py <<'PYEOF'
+          import os, re, sys, json, time, datetime, subprocess, urllib.request, urllib.parse
+          import xml.etree.ElementTree as ET
+          from concurrent.futures import ThreadPoolExecutor
+
+          S3 = os.environ.get("S3_BASE", "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision")
+          MARKET = os.environ.get("MARKET", "futures/um").strip("/")
+          START = os.environ.get("START", "2020-01")
+          END = os.environ.get("END", "").strip()
+          REGEX = re.compile(os.environ.get("SYMBOL_REGEX", r"^[A-Z0-9]+USDT$"))
+          SHARDS = int(os.environ.get("SHARDS", "20"))
+          TAG_BASE = os.environ.get("TAG_BASE", "futures-um-1m")
+          FORCE = os.environ.get("FORCE", "false").lower() == "true"
+          LIMIT = int(os.environ.get("LIMIT_SYMBOLS", "0") or 0)
+          RUN = os.environ.get("MODE", "plan") == "run"
+          GH = os.environ.get("GH_BIN", "gh")
+          REPO = os.environ.get("REPO", "")
+          PER_RELEASE = 900
+          BASE = f"data/{MARKET}/monthly/klines/"
+
+
+          def get(url, tries=6):
+              for k in range(tries):
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "cpk-plan"}), timeout=60) as r:
+                          return r.read()
+                  except Exception as e:
+                      if k == tries - 1:
+                          raise
+                      time.sleep(2 * (k + 1))
+
+
+          def _lname(e):
+              return e.tag.split("}")[-1]
+
+
+          def s3_list(prefix, delimiter):
+              """returns (keys, common_prefixes); follows pagination"""
+              keys, pres, marker = [], [], ""
+              while True:
+                  q = {"prefix": prefix, "max-keys": "1000"}
+                  if delimiter:
+                      q["delimiter"] = delimiter
+                  if marker:
+                      q["marker"] = marker
+                  root = ET.fromstring(get(S3 + "?" + urllib.parse.urlencode(q)))
+                  trunc, nxt, last = False, "", ""
+                  for el in root:
+                      n = _lname(el)
+                      if n == "Contents":
+                          for c in el:
+                              if _lname(c) == "Key":
+                                  keys.append(c.text)
+                                  last = c.text
+                      elif n == "CommonPrefixes":
+                          for c in el:
+                              if _lname(c) == "Prefix":
+                                  pres.append(c.text)
+                                  last = c.text
+                      elif n == "IsTruncated":
+                          trunc = (el.text or "").strip().lower() == "true"
+                      elif n == "NextMarker":
+                          nxt = el.text or ""
+                  if not trunc:
+                      return keys, pres
+                  marker = nxt or last
+
+
+          def prev_month():
+              t = datetime.datetime.now(datetime.timezone.utc)
+              y, m = t.year, t.month - 1
+              if m == 0:
+                  y, m = y - 1, 12
+              return f"{y:04d}-{m:02d}"
+
+
+          def gh(*a, check=True):
+              r = subprocess.run([GH, *a], capture_output=True, text=True)
+              if check and r.returncode != 0:
+                  raise SystemExit(f"gh {' '.join(a)} failed: {r.stderr[:400]}")
+              return r
+
+
+          def existing_assets(tag):
+              r = gh("api", f"repos/{REPO}/releases/tags/{tag}", "--jq", ".id", check=False)
+              if r.returncode != 0 or not r.stdout.strip():
+                  return set()
+              rid = r.stdout.strip()
+              r = gh("api", "--paginate", f"repos/{REPO}/releases/{rid}/assets?per_page=100", "--jq", ".[].name")
+              return set(x.strip() for x in r.stdout.splitlines() if x.strip())
+
+
+          def main():
+              end = END or prev_month()
+              _, pres = s3_list(BASE, "/")
+              syms = sorted(p[len(BASE):].strip("/") for p in pres)
+              allsyms = len(syms)
+              syms = [s for s in syms if REGEX.match(s)]
+              print(f"market={MARKET} | symbols in listing: {allsyms} | matching {REGEX.pattern}: {len(syms)} | months {START}..{end}")
+              if LIMIT:
+                  syms = syms[:LIMIT]
+                  print(f"LIMIT_SYMBOLS={LIMIT} -> only first {len(syms)} symbols")
+              if len(syms) > PER_RELEASE * 5:
+                  raise SystemExit("too many symbols")
+
+              def months_of(sym):
+                  keys, _ = s3_list(f"{BASE}{sym}/1m/", "")
+                  ms = []
+                  for k in keys:
+                      m = re.search(re.escape(sym) + r"-1m-(\d{4}-\d{2})\.zip$", k)
+                      if m and START <= m.group(1) <= end:
+                          ms.append(m.group(1))
+                  return sym, sorted(ms)
+
+              with ThreadPoolExecutor(12) as ex:
+                  res = list(ex.map(months_of, syms))
+              items = []
+              for i, (sym, ms) in enumerate(res):
+                  if ms:
+                      items.append({"sym": sym, "months": ms, "tag": f"{TAG_BASE}-{i // PER_RELEASE + 1}" if len(syms) > PER_RELEASE else TAG_BASE})
+              tags = sorted(set(it["tag"] for it in items))
+              have = {}
+              if not FORCE:
+                  for t in tags:
+                      have[t] = existing_assets(t)
+              todo = [it for it in items if f"{it['sym']}-1m.cpk" not in have.get(it["tag"], set())]
+              nfiles = sum(len(it["months"]) for it in todo)
+              print(f"symbols with data: {len(items)} | already in release: {len(items) - len(todo)} | to do: {len(todo)} symbols, {nfiles} monthly files")
+              n = max(1, min(SHARDS, len(todo)))
+              shards = [[] for _ in range(n)]
+              load = [0] * n
+              for it in sorted(todo, key=lambda x: -len(x["months"])):
+                  j = load.index(min(load))
+                  shards[j].append(it)
+                  load[j] += len(it["months"])
+              print("shard loads (monthly files):", load)
+              os.makedirs("plan", exist_ok=True)
+              json.dump({"market": MARKET, "shards": shards}, open("plan/plan.json", "w"))
+              if RUN:
+                  for t in tags:
+                      if gh("release", "view", t, check=False).returncode != 0:
+                          gh("release", "create", t, "--title", t, "--notes", f"Packed Binance {MARKET} 1m klines, one .cpk per symbol (lossless, see candle_pack.py)")
+              out = os.environ.get("GITHUB_OUTPUT")
+              run = RUN and len(todo) > 0
+              if out:
+                  with open(out, "a") as f:
+                      f.write(f"run={'true' if run else 'false'}\n")
+                      f.write("matrix=" + json.dumps({"shard": list(range(n))}) + "\n")
+              summ = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summ:
+                  with open(summ, "a") as f:
+                      f.write(f"### Plan ({'RUN' if RUN else 'DRY'})\n- symbols in listing: {allsyms}, matching: {len(syms)}\n- to do: {len(todo)} symbols, {nfiles} monthly files, {n} shards\n- months {START}..{end}\n")
+              if not RUN:
+                  print("DRY RUN: nothing downloaded. Re-run with mode=run to start.")
+
+
+          main()
+          PYEOF
+          python3 plan.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan/plan.json
+
+  shard:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+      - name: Download, pack, verify, upload (this shard)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHARD: ${{ matrix.shard }}
+          MARKET: ${{ inputs.market }}
+        run: |
+          cat > shard.py <<'PYEOF'
+          import os, re, sys, json, time, shutil, hashlib, subprocess, urllib.request
+          from concurrent.futures import ThreadPoolExecutor
+
+          BASE = os.environ.get("DL_BASE", "https://data.binance.vision")
+          MARKET = os.environ.get("MARKET", "futures/um").strip("/")
+          SHARD = int(os.environ["SHARD"])
+          GH = os.environ.get("GH_BIN", "gh")
+          PY = sys.executable
+
+
+          def get(url, tries=6):
+              for k in range(tries):
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "cpk-shard"}), timeout=120) as r:
+                          return r.read()
+                  except Exception as e:
+                      if k == tries - 1:
+                          raise
+                      time.sleep(3 * (k + 1))
+
+
+          def run(cmd):
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+          def one(it):
+              sym, months, tag = it["sym"], it["months"], it["tag"]
+              d = os.path.join("w", sym)
+              shutil.rmtree(d, ignore_errors=True)
+              os.makedirs(d)
+              os.makedirs("out", exist_ok=True)
+
+              def dl(m):
+                  F = f"{sym}-1m-{m}.zip"
+                  url = f"{BASE}/data/{MARKET}/monthly/klines/{sym}/1m/{F}"
+                  data = get(url)
+                  want = get(url + ".CHECKSUM").decode().split()[0].lower()
+                  if hashlib.sha256(data).hexdigest() != want:
+                      raise RuntimeError(f"checksum mismatch {F}")
+                  with open(os.path.join(d, F), "wb") as f:
+                      f.write(data)
+
+              with ThreadPoolExecutor(4) as ex:
+                  list(ex.map(dl, months))
+              dst = os.path.join("out", f"{sym}-1m.cpk")
+              rc, txt = run([PY, "candle_pack.py", "pack", d, dst])
+              if rc != 0 or "all 64-bit values verified identical" not in txt:
+                  raise RuntimeError("pack failed: " + txt[-300:])
+              rc, txt2 = run([PY, "candle_pack.py", "verify", d, dst])
+              if rc != 0 or "IDENTICAL" not in txt2:
+                  raise RuntimeError("verify failed: " + txt2[-300:])
+              sz = os.path.getsize(dst)
+              sha = hashlib.sha256(open(dst, "rb").read()).hexdigest()
+              rc, txt3 = run([GH, "release", "upload", tag, dst, "--clobber"])
+              if rc != 0:
+                  raise RuntimeError("upload failed: " + txt3[-300:])
+              shutil.rmtree(d, ignore_errors=True)
+              os.remove(dst)
+              return f"{sym}: {len(months)} months, {sz / 1e6:.1f} MB, sha256 {sha[:16]}..., first {months[0]} last {months[-1]}"
+
+
+          def main():
+              plan = json.load(open("plan/plan.json"))
+              items = plan["shards"][SHARD]
+              print(f"shard {SHARD}: {len(items)} symbols")
+              bad = []
+              t0 = time.time()
+              for k, it in enumerate(items, 1):
+                  t = time.time()
+                  try:
+                      print(f"[{k}/{len(items)}] OK  {one(it)}  ({time.time() - t:.0f}s)", flush=True)
+                  except Exception as e:
+                      print(f"[{k}/{len(items)}] FAIL {it['sym']}: {e}", flush=True)
+                      bad.append(it["sym"])
+              print(f"shard {SHARD} done in {(time.time() - t0) / 60:.1f} min; failed: {bad}")
+              if bad:
+                  sys.exit(1)
+
+
+          main()
+          PYEOF
+          python shard.py
