@@ -1,0 +1,60 @@
+name: fetch-and-pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Symbols separated by space"
+        default: "BTCUSDT"
+      months:
+        description: "Months YYYY-MM separated by space"
+        default: "2025-03"
+      tag:
+        description: "Release tag to upload to"
+        default: "data-test"
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install numpy
+        run: pip install numpy
+      - name: Download, verify checksum, pack, verify pack
+        env:
+          SYMBOLS: ${{ inputs.symbols }}
+          MONTHS: ${{ inputs.months }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl out
+          for S in $SYMBOLS; do
+            for M in $MONTHS; do
+              F="$S-1m-$M.zip"
+              U="https://data.binance.vision/data/spot/monthly/klines/$S/1m/$F"
+              echo "=== $F"
+              curl -fsSL --retry 3 -o "dl/$F" "$U"
+              curl -fsSL --retry 3 -o "dl/$F.CHECKSUM" "$U.CHECKSUM"
+              (cd dl && sha256sum -c "$F.CHECKSUM")
+              python candle_pack.py pack "dl/$F" "out/$S-1m-$M.cpk"
+              python candle_pack.py verify "dl/$F" "out/$S-1m-$M.cpk" | tee v.txt
+              grep -q IDENTICAL v.txt
+              sha256sum "out/$S-1m-$M.cpk"
+              rm -f "dl/$F" "dl/$F.CHECKSUM"
+            done
+          done
+          ls -l out
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Packed Binance 1m klines (.cpk, lossless, see candle_pack.py)"
+          gh release upload "$TAG" out/*.cpk --clobber
