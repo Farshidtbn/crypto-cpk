@@ -24,7 +24,7 @@ on:
         default: true
       verify_limit:
         description: "Test: only the first N instruments in the start check (0 = all)"
-        default: "30"
+        default: "0"
       tag:
         description: "Release tag that receives the plain result files"
         default: "dukascopy-plan"
@@ -257,6 +257,12 @@ jobs:
               else if (b.n > 0) verdict = 'DATA_BEFORE_CLAIMED_START';
               else if (a.n > 0) verdict = 'OK';
               else verdict = 'NO_DATA_AT_START';
+              if (verdict === 'NO_DATA_AT_START') {                  // second look: the first 30 days (ignoreFlats drops empty minutes, so a quiet first week can look like "no data")
+                const c = await q(it.id, it.start, iso(s + 30 * day));
+                if (!c.ok) verdict = 'ERROR';
+                else if (c.n > 0) { verdict = 'LATE_START_WITHIN_30D'; a.first = c.first; }
+                else verdict = 'NO_DATA_30D';
+              }
               consecutiveErr = verdict === 'ERROR' ? consecutiveErr + 1 : 0;
               out.push([it.id, it.start, it.known_m1, a.ok ? a.n : '', a.first ? new Date(a.first).toISOString() : '', b.ok ? b.n : '', verdict, (a.err || b.err || '')].join(','));
               done++;
@@ -266,7 +272,11 @@ jobs:
             fs.writeFileSync('dukascopy_start_check.csv', out.join('\n') + '\n');
             const cnt = {}; out.slice(1).forEach((l) => { const v = l.split(',')[6]; cnt[v] = (cnt[v] || 0) + 1; });
             console.log('verdicts:', JSON.stringify(cnt));
-            fs.writeFileSync('dukascopy_start_check_summary.txt', 'checked ' + done + ' of ' + list.length + ' instruments\nverdicts: ' + JSON.stringify(cnt) + '\n');
+            const notOk = out.slice(1).filter((l) => l.split(',')[6] !== 'OK').slice(0, 80).map((l) => {
+              const p = l.split(',');
+              return p[0] + ' | claimed ' + p[1] + ' | ' + p[6] + (p[4] ? ' | first candle ' + p[4].slice(0, 10) : '') + (p[7] ? ' | ' + p[7] : '');
+            });
+            fs.writeFileSync('dukascopy_start_check_summary.txt', 'checked ' + done + ' of ' + list.length + ' instruments\nverdicts: ' + JSON.stringify(cnt) + '\nnot OK (first 80):\n' + notOk.join('\n') + '\n');
           })();
           JSEOF
           node verify.js 2>&1 | tail -30
