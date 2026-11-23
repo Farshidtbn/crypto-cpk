@@ -1,0 +1,95 @@
+name: schedule-latency-test
+
+# MEASURES how punctual GitHub's own scheduler really is for THIS repository.
+#  - schedule event: every 5 minutes (the shortest allowed; minutes 2,7,12,... because the top of the hour is the busiest) a tiny job runs and does nothing.
+#  - Run it by hand (workflow_dispatch) after >= 24 h: it reads the real start times of the scheduled runs from GitHub and writes a report
+#    (how many runs were dropped, how late they were, the longest hole) to the job summary AND prints it in the log.
+# Cost: ~288 runs of a few seconds per day. Delete the file when the measurement is done.
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Report window in hours (how far back to look)"
+        default: "24"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  tick:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "scheduled tick at $(date -u +%FT%TZ)"
+
+  report:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOURS: ${{ inputs.hours || '24' }}
+    steps:
+      - name: Report
+        run: |
+          cat > analyze.py <<'PYEOF'
+          import sys, os, datetime, statistics
+
+          hours = float(os.environ.get("HOURS", "24"))
+          now = datetime.datetime.now(datetime.timezone.utc)
+          since = now - datetime.timedelta(hours=hours)
+
+
+          def ts(s):
+              return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+          runs = []
+          for line in sys.stdin:
+              p = line.split()
+              if len(p) >= 2:
+                  c, st = ts(p[0]), ts(p[1])
+                  if c >= since: runs.append((c, st))
+          runs.sort()
+          if len(runs) < 3:
+              print(f"only {len(runs)} scheduled runs in the last {hours:g} h - too few. Wait longer (the first runs can take hours) and run the report again.")
+              sys.exit(0)
+
+
+          def pct(a, q):
+              a = sorted(a)
+              return a[min(len(a) - 1, int(round(q * (len(a) - 1))))]
+
+
+          first, last = runs[0][0], runs[-1][0]
+          span_h = (last - first).total_seconds() / 3600
+          expected = int(span_h * 12) + 1
+          gaps = [(runs[i + 1][0] - runs[i][0]).total_seconds() / 60 for i in range(len(runs) - 1)]
+          late = []                                                  # minutes after the nearest EARLIER scheduled slot (minute % 5 == 2)
+          for c, _ in runs:
+              m = c.minute + c.second / 60
+              late.append((m - 2) % 5)
+          qd = [(st - c).total_seconds() for c, st in runs]          # seconds from "run created" to "job started"
+          over5 = sum(1 for g in gaps if g > 5.5)
+          over15 = sum(1 for g in gaps if g > 15)
+          over30 = sum(1 for g in gaps if g > 30)
+          L = [f"Scheduled runs seen: {len(runs)} between {first:%Y-%m-%d %H:%M} and {last:%Y-%m-%d %H:%M} UTC ({span_h:.1f} h)",
+               f"Expected at one run per 5 min: about {expected}  ->  missing (dropped) about {max(0, expected - len(runs))} ({100 * max(0, expected - len(runs)) / expected:.0f} %)",
+               f"Gap between consecutive runs (minutes): median {statistics.median(gaps):.1f} | p90 {pct(gaps, .9):.1f} | p99 {pct(gaps, .99):.1f} | longest {max(gaps):.1f}",
+               f"Gaps over 5.5 min: {over5} of {len(gaps)} | over 15 min: {over15} | over 30 min: {over30}",
+               f"Lateness of the start after the planned minute (modulo 5): median {statistics.median(late):.1f} | p90 {pct(late, .9):.1f} | max {max(late):.1f} min",
+               f"Seconds from 'run created' to 'job started': median {statistics.median(qd):.0f} | p90 {pct(qd, .9):.0f} | max {max(qd):.0f}",
+               "",
+               "How to read it: a bot that needs a decision every 5 minutes can only rely on this if 'over 15 min' is ~0 and 'dropped' is ~0 for YOUR repository."]
+          rep = "\n".join(L)
+          print(rep)
+          sm = os.environ.get("GITHUB_STEP_SUMMARY")
+          if sm:
+              open(sm, "a").write("### Schedule latency report\n```\n" + rep + "\n```\n")
+          PYEOF
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/schedule-latency-test.yml/runs?event=schedule&per_page=100" \
+            --jq '.workflow_runs[] | "\(.created_at) \(.run_started_at)"' | python3 analyze.py
