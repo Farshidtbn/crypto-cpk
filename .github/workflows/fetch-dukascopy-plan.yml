@@ -21,6 +21,10 @@ on:
       verify_start:
         description: "true = check the real 1-minute start of every instrument (slow: about 14 requests per instrument)"
         type: boolean
+        default: false
+      find_start:
+        description: "true = for every instrument whose claimed 1-minute start was NOT confirmed, FIND the real first day (1-minute first; if there is no 1-minute data: 1-hour, then daily)"
+        type: boolean
         default: true
       verify_limit:
         description: "Test: only the first N instruments in the start check (0 = all)"
@@ -44,6 +48,7 @@ jobs:
       PROBE_DAYS: ${{ inputs.probe_days || '10' }}
       VERIFY_START: ${{ inputs.verify_start || 'false' }}
       VERIFY_LIMIT: ${{ inputs.verify_limit || '0' }}
+      FIND_START: ${{ inputs.find_start || 'false' }}
       TAG: ${{ inputs.tag || 'dukascopy-plan' }}
     steps:
       - uses: actions/setup-node@v4
@@ -281,6 +286,92 @@ jobs:
           JSEOF
           node verify.js 2>&1 | tail -30
 
+      - name: Find the REAL first day of data (1-minute first, else 1-hour, else daily)
+        if: ${{ inputs.find_start }}
+        continue-on-error: true
+        run: |
+          if [ ! -f dukascopy_start_check.csv ]; then gh release download "$TAG" -p dukascopy_start_check.csv --clobber || true; fi
+          cat > find_start.js <<'JSEOF'
+          const { getHistoricalRates } = require('dukascopy-node');
+          const fs = require('fs');
+          if (!fs.existsSync('dukascopy_start_check.csv')) { console.log('no dukascopy_start_check.csv - run with verify_start = true once'); process.exit(0); }
+          const rows = fs.readFileSync('dukascopy_start_check.csv', 'utf8').trim().split('\n').slice(1).map((l) => l.split(','));
+          const day = 86400000, today = Date.now();
+          const iso = (t) => new Date(t).toISOString().slice(0, 10);
+          async function q(id, from, to, tf) {
+            for (let k = 0; k < 2; k++) {
+              try {
+                const d = await getHistoricalRates({ instrument: id, dates: { from, to }, timeframe: tf, priceType: 'bid', format: 'json', volumes: true,
+                  ignoreFlats: true, retryCount: 2, failAfterRetryCount: true, batchSize: 7, pauseBetweenBatchesMs: 200 });
+                return { ok: true, n: d.length, first: d.length ? d[0].timestamp : null, last: d.length ? d[d.length - 1].timestamp : null };
+              } catch (e) { if (k) return { ok: false, err: ((e && e.name) || '') + ': ' + String((e && e.message) || e).replace(/[\r\n,]+/g, ' ').slice(0, 110) }; }
+            }
+          }
+          async function findOne(id) {
+            const r = { id, d1_first: '', d1_last: '', m1_first: '', best_tf: '', verdict: '', err: '' };
+            const d1 = await q(id, '1995-01-01', iso(today), 'd1');
+            if (!d1.ok) { r.verdict = 'ERROR'; r.err = d1.err; return r; }
+            let from = null;
+            if (d1.n > 0) { r.d1_first = iso(d1.first); r.d1_last = iso(d1.last); from = d1.first; }
+            else {                                                    // no daily data: look at the last 2 years with 1-hour candles
+              const h = await q(id, iso(today - 730 * day), iso(today), 'h1');
+              if (!h.ok) { r.verdict = 'ERROR'; r.err = h.err; return r; }
+              if (h.n === 0) { r.verdict = 'NO_DATA'; return r; }
+              r.best_tf = 'h1'; r.verdict = 'H1_ONLY'; r.m1_first = ''; r.d1_first = iso(h.first); r.d1_last = iso(h.last); return r;
+            }
+            const end = d1.last;
+            let prev = from, hit = null;                              // coarse scan: 5 days of 1-minute data every 90 days
+            for (let t = from; t <= end; t += 90 * day) {
+              const w = await q(id, iso(t), iso(t + 5 * day), 'm1');
+              if (!w.ok) { r.verdict = 'ERROR'; r.err = w.err; return r; }
+              if (w.n > 0) { hit = t; break; }
+              prev = t;
+            }
+            if (hit === null) {                                       // no 1-minute found: smallest available = 1-hour, else daily
+              const h = await q(id, iso(from), iso(Math.min(end, from + 90 * day)), 'h1');
+              if (h.ok && h.n > 0) { r.best_tf = 'h1'; r.verdict = 'H1_ONLY'; } else { r.best_tf = 'd1'; r.verdict = 'D1_ONLY'; }
+              return r;
+            }
+            const f = await q(id, iso(prev), iso(hit + 5 * day), 'm1');   // refine: first candle between the last empty probe and the first hit
+            if (!f.ok) { r.verdict = 'ERROR'; r.err = f.err; return r; }
+            r.m1_first = f.first ? iso(f.first) : ''; r.best_tf = 'm1'; r.verdict = 'M1_FOUND';
+            return r;
+          }
+          (async () => {
+            const todo = rows.filter((x) => x[6] !== 'OK').map((x) => x[0]);
+            const lim = parseInt(process.env.VERIFY_LIMIT || '0', 10);
+            const ids = lim > 0 ? todo.slice(0, lim) : todo;
+            console.log('instruments to search:', ids.length);
+            const res = {}; let idx = 0, done = 0, errRun = 0, stop = false;
+            async function worker() {
+              while (!stop && idx < ids.length) {
+                const id = ids[idx++]; const r = await findOne(id); res[id] = r; done++;
+                errRun = r.verdict === 'ERROR' ? errRun + 1 : 0;
+                if (errRun >= 12) { stop = true; console.log('STOP: many errors in a row (blocked or rate-limited?)'); }
+                if (done % 20 === 0) console.log('searched', done, 'of', ids.length);
+              }
+            }
+            await Promise.all([worker(), worker(), worker(), worker()]);
+            const H = 'id,claimed_start,m1_start_confirmed_by_check,best_timeframe,real_first_day,d1_first,d1_last,verdict,error';
+            const out = [H]; const cnt = {};
+            for (const x of rows) {
+              const id = x[0]; let line;
+              if (x[6] === 'OK') line = [id, x[1], 'yes', 'm1', x[4] ? x[4].slice(0, 10) : x[1], '', '', 'OK_CONFIRMED', ''];
+              else if (res[id]) { const r = res[id]; line = [id, x[1], 'no', r.best_tf, r.best_tf === 'm1' ? r.m1_first : r.d1_first, r.d1_first, r.d1_last, r.verdict, r.err]; }
+              else line = [id, x[1], 'no', '', '', '', '', 'NOT_SEARCHED', ''];
+              cnt[line[7]] = (cnt[line[7]] || 0) + 1; out.push(line.join(','));
+            }
+            fs.writeFileSync('dukascopy_real_start.csv', out.join('\n') + '\n');
+            const notm1 = out.slice(1).filter((l) => !['OK_CONFIRMED', 'M1_FOUND'].includes(l.split(',')[7])).slice(0, 60);
+            const staleCut = iso(today - 30 * day);
+            const stale = out.slice(1).filter((l) => { const p = l.split(','); return p[6] && p[6] < staleCut; }).length;
+            const s = 'searched ' + done + ' of ' + ids.length + '\nverdicts: ' + JSON.stringify(cnt) + '\ninstruments whose last daily candle is older than 30 days (stopped trading?): ' + stale +
+              '\nNOT 1-minute (first 60): id | claimed | best | first day | verdict\n' + notm1.map((l) => { const p = l.split(','); return [p[0], p[1], p[3], p[4], p[7], p[8]].join(' | '); }).join('\n') + '\n';
+            fs.writeFileSync('dukascopy_real_start_summary.txt', s); console.log(s.split('\n').slice(0, 4).join('\n'));
+          })();
+          JSEOF
+          node find_start.js 2>&1 | tail -30
+
       - name: Show in job summary and upload plain files to the release
         run: |
           {
@@ -298,10 +389,16 @@ jobs:
               cat dukascopy_start_check_summary.txt
               echo '```'
             fi
+            if [ -f dukascopy_real_start_summary.txt ]; then
+              echo '### Real first day (1-minute first, else 1-hour, else daily)'
+              echo '```'
+              cat dukascopy_real_start_summary.txt
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --title "$TAG" --notes "Dukascopy plan results (plain files, no zip)"
           fi
           FILES="dukascopy_plan.csv dukascopy_plan_summary.txt dukascopy_probe.txt dukascopy_probe.json dukascopy_meta_raw.json"
-          for f in dukascopy_start_check.csv dukascopy_start_check_summary.txt; do [ -f "$f" ] && FILES="$FILES $f"; done
+          for f in dukascopy_start_check.csv dukascopy_start_check_summary.txt dukascopy_real_start.csv dukascopy_real_start_summary.txt; do [ -f "$f" ] && FILES="$FILES $f"; done
           gh release upload "$TAG" $FILES --clobber
