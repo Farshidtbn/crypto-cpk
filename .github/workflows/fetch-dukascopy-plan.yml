@@ -21,10 +21,10 @@ on:
       verify_start:
         description: "true = check the real 1-minute start of every instrument (slow: about 14 requests per instrument)"
         type: boolean
-        default: false
+        default: true
       verify_limit:
         description: "Test: only the first N instruments in the start check (0 = all)"
-        default: "0"
+        default: "30"
       tag:
         description: "Release tag that receives the plain result files"
         default: "dukascopy-plan"
