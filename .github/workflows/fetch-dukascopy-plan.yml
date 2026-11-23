@@ -1,0 +1,293 @@
+name: fetch-dukascopy-plan
+
+# STEP 1 (plan only, v2): no big download.
+#  - lists every Dukascopy instrument with its group, a proposed RELEASE CATEGORY and the 1-minute start date known to the library
+#  - tests the connection with real 1-minute candles (Bid AND Ask) and MEASURES the seconds per daily request -> estimate of the full job
+#  - verify_start=true : for every instrument asks Dukascopy for real 1-minute candles around the claimed start date
+#      (does data exist on that date? does data already exist BEFORE it?)  -> dukascopy_start_check.csv
+# Results: job summary + plain files (no zip) in the release <tag>.
+on:
+  workflow_dispatch:
+    inputs:
+      probe_instrument:
+        description: "Instrument id for the connection / speed test"
+        default: "eurusd"
+      probe_day:
+        description: "First day of the speed test (YYYY-MM-DD, in the past)"
+        default: "2025-03-03"
+      probe_days:
+        description: "How many consecutive days the speed test requests (per side)"
+        default: "10"
+      verify_start:
+        description: "true = check the real 1-minute start of every instrument (slow: about 14 requests per instrument)"
+        type: boolean
+        default: false
+      verify_limit:
+        description: "Test: only the first N instruments in the start check (0 = all)"
+        default: "0"
+      tag:
+        description: "Release tag that receives the plain result files"
+        default: "dukascopy-plan"
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PROBE_INSTRUMENT: ${{ inputs.probe_instrument || 'eurusd' }}
+      PROBE_DAY: ${{ inputs.probe_day || '2025-03-03' }}
+      PROBE_DAYS: ${{ inputs.probe_days || '10' }}
+      VERIFY_START: ${{ inputs.verify_start || 'false' }}
+      VERIFY_LIMIT: ${{ inputs.verify_limit || '0' }}
+      TAG: ${{ inputs.tag || 'dukascopy-plan' }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dukascopy-node
+        run: npm install dukascopy-node
+
+      - name: Dump instrument metadata of the library
+        run: |
+          cat > meta.js <<'JSEOF'
+          const d = require('dukascopy-node');
+          const m = d.instrumentMetaData || {};
+          require('fs').writeFileSync('dukascopy_meta_raw.json', JSON.stringify(m));
+          console.log('instrumentMetaData entries:', Array.isArray(m) ? m.length : Object.keys(m).length);
+          JSEOF
+          node meta.js
+
+      - name: Test - connection and speed with real 1-minute candles (Bid and Ask)
+        continue-on-error: true
+        run: |
+          cat > probe.js <<'JSEOF'
+          const { getHistoricalRates } = require('dukascopy-node');
+          const fs = require('fs');
+          const inst = process.env.PROBE_INSTRUMENT;
+          const day = process.env.PROBE_DAY;
+          const days = Math.max(1, parseInt(process.env.PROBE_DAYS || '10', 10));
+          const end = new Date(new Date(day + 'T00:00:00Z').getTime() + days * 86400000).toISOString().slice(0, 10);
+          (async () => {
+            console.log('probe:', inst, day, '->', end, '(UTC), timeframe m1,', days, 'daily requests per side');
+            const res = { instrument: inst, from: day, to: end, days };
+            let secs = 0, okSides = 0;
+            for (const side of ['bid', 'ask']) {
+              const t0 = Date.now();
+              try {
+                const d = await getHistoricalRates({
+                  instrument: inst, dates: { from: day, to: end }, timeframe: 'm1', priceType: side,
+                  format: 'json', volumes: true, ignoreFlats: false, retryCount: 2, failAfterRetryCount: true
+                });
+                const s = (Date.now() - t0) / 1000;
+                secs += s; okSides++;
+                res[side] = { ok: true, candles: d.length, seconds: s };
+                console.log(side, 'OK', d.length, 'candles in', s.toFixed(1), 's | first:', JSON.stringify(d[0]), '| last:', JSON.stringify(d[d.length - 1]));
+              } catch (e) {
+                res[side] = { ok: false, error: (e && e.name) + ' - ' + (e && e.message) };
+                console.log(side, 'FAIL', e && e.name, '-', e && e.message);
+              }
+            }
+            if (okSides) res.sec_per_request = secs / (okSides * days);
+            console.log('seconds per daily request (default batching):', res.sec_per_request === undefined ? 'n/a' : res.sec_per_request.toFixed(3));
+            fs.writeFileSync('dukascopy_probe.json', JSON.stringify(res));
+          })();
+          JSEOF
+          node probe.js 2>&1 | tee dukascopy_probe.txt
+
+      - name: Build the plan (instruments, categories, releases, estimate)
+        run: |
+          cat > plan.py <<'PYEOF'
+          import os, re, csv, json, datetime, collections, urllib.request
+
+          PER_RELEASE = 900
+          URL = os.environ.get("README_URL", "https://raw.githubusercontent.com/Leo4815162342/dukascopy-node/master/README.md")
+          req = urllib.request.Request(URL, headers={"User-Agent": "dukascopy-plan"})
+          text = urllib.request.urlopen(req, timeout=60).read().decode("utf-8")
+
+          head = re.compile(r"^###\s+(.+?)\s*$")
+          row = re.compile(r"^\|\s*\[(.+?)\]\([^)]*\)\s*\|\s*`([^`]+)`\s*\|\s*([A-Z][a-z]{2} \d{1,2}, \d{4})\s*\|")
+          INDEX_GROUPS = {"africa", "america", "asia", "europe"}
+
+
+          def category(group):
+              g = group.lower()
+              if g.startswith("forex") and "metal" in g: return "metals"
+              if g.startswith("forex"): return "forex"
+              if "metals" in g: return "metals"
+              if "energy" in g: return "energy"
+              if "agricultural" in g: return "agri"
+              if g.startswith("bonds"): return "bonds"
+              if "etf" in g: return "etf"
+              if g.startswith("crypto"): return "crypto"
+              if g in INDEX_GROUPS: return "indices"
+              if "mutual" in g: return "mutual-funds"
+              if g == "ungrouped": return "other"
+              return "stocks"                                                    # every country group (Germany, Japan, United States ...)
+
+
+          group = "Ungrouped"
+          rows = {}
+          for line in text.splitlines():
+              m = head.match(line)
+              if m:
+                  group = re.sub(r"[^\x00-\x7F]+", "", m.group(1)).strip() or group
+                  continue
+              m = row.match(line)
+              if m:
+                  name, iid, d = m.groups()
+                  rows[iid] = {"group": group, "id": iid, "name": name, "readme_earliest": datetime.datetime.strptime(d, "%b %d, %Y").date()}
+          print("instruments found in the library README:", len(rows))
+
+          meta = json.load(open("dukascopy_meta_raw.json"))
+          items = list(meta.items()) if isinstance(meta, dict) else [((v.get("id") or v.get("instrument") or ""), v) for v in meta if isinstance(v, dict)]
+
+
+          def to_date(v):
+              try:
+                  if isinstance(v, (int, float)):
+                      v = v / 1000 if v > 1e11 else v
+                      return datetime.datetime.fromtimestamp(v, datetime.timezone.utc).date()
+                  if isinstance(v, str):
+                      return datetime.datetime.fromisoformat(v.replace("Z", "+00:00")).date()
+              except Exception:
+                  return None
+              return None
+
+
+          m1, keys_seen = {}, set()
+          for k, v in items:
+              if not isinstance(v, dict): continue
+              keys_seen |= set(v.keys())
+              iid = v.get("id") or k
+              for kk, vv in v.items():
+                  if "minute" in kk.lower():
+                      d = to_date(vv)
+                      if d: m1[iid] = d
+
+          today = datetime.datetime.now(datetime.timezone.utc).date()
+          out = []
+          for iid, r in sorted(rows.items(), key=lambda x: (category(x[1]["group"]), x[1]["group"], x[0])):
+              start = m1.get(iid)
+              basis = "metadata(1-minute start)" if start else "README(earliest, may be too early for 1-minute)"
+              start = start or r["readme_earliest"]
+              days = max(0, (today - start).days)
+              out.append({"category": category(r["group"]), "group": r["group"], "id": iid, "name": r["name"], "readme_earliest": r["readme_earliest"],
+                          "m1_start": m1.get(iid, ""), "basis": basis, "start_used": start, "days": days, "files_bid_ask": days * 2})
+
+          # proposed releases: dukascopy-1m-<category>, split into -2, -3 ... after PER_RELEASE symbols
+          by_cat = collections.OrderedDict()
+          for r in out: by_cat.setdefault(r["category"], []).append(r)
+          for cat, lst in by_cat.items():
+              for k, r in enumerate(lst):
+                  r["release_tag"] = f"dukascopy-1m-{cat}" if len(lst) <= PER_RELEASE else f"dukascopy-1m-{cat}-{k // PER_RELEASE + 1}"
+
+          cols = ["category", "release_tag", "group", "id", "name", "readme_earliest", "m1_start", "basis", "start_used", "days", "files_bid_ask"]
+          with open("dukascopy_plan.csv", "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              for r in out: w.writerow({c: r[c] for c in cols})
+          json.dump([{"id": r["id"], "start": str(r["start_used"]), "known_m1": bool(r["m1_start"])} for r in out], open("dukascopy_start_input.json", "w"))
+
+          total = sum(r["files_bid_ask"] for r in out)
+          spr, probe_note = None, "no speed measurement (the test step failed)"
+          try:
+              pj = json.load(open("dukascopy_probe.json"))
+              spr = pj.get("sec_per_request")
+              probe_note = f"measured {spr:.3f} s per daily request (Bid/Ask average, default batching, 1 runner)" if spr else probe_note
+          except Exception:
+              pass
+          lines = [f"Dukascopy plan - {today} (UTC)", f"instruments: {len(out)} | categories: {len(by_cat)}",
+                   f"1-minute start date known from library metadata: {sum(1 for r in out if r['m1_start'])} of {len(out)}",
+                   f"estimated daily files (Bid + Ask, every calendar day, from the start used): {total:,}", probe_note]
+          if spr:
+              one = total * spr / 3600
+              lines.append(f"estimate (if Dukascopy keeps this speed and does not block): {one:.0f} h on one runner; about {one / 20:.1f} h split over 20 parallel jobs (6 h limit per job)")
+          lines += ["", "category | instruments | estimated files | releases"]
+          for cat, lst in by_cat.items():
+              lines.append(f"{cat} | {len(lst)} | {sum(r['files_bid_ask'] for r in lst):,} | {len(set(r['release_tag'] for r in lst))}")
+          lines += ["", "metadata fields seen: " + ", ".join(sorted(keys_seen))]
+          report = "\n".join(lines)
+          print(report)
+          open("dukascopy_plan_summary.txt", "w", encoding="utf-8").write(report + "\n")
+          PYEOF
+          python3 plan.py
+
+      - name: Check the real 1-minute start of every instrument (only if verify_start = true)
+        if: ${{ inputs.verify_start }}
+        continue-on-error: true
+        run: |
+          cat > verify.js <<'JSEOF'
+          const { getHistoricalRates } = require('dukascopy-node');
+          const fs = require('fs');
+          let list = JSON.parse(fs.readFileSync('dukascopy_start_input.json', 'utf8'));
+          const lim = parseInt(process.env.VERIFY_LIMIT || '0', 10);
+          if (lim > 0) list = list.slice(0, lim);
+          const day = 86400000;
+          const iso = (t) => new Date(t).toISOString().slice(0, 10);
+          async function q(id, from, to) {
+            try {
+              const d = await getHistoricalRates({
+                instrument: id, dates: { from, to }, timeframe: 'm1', priceType: 'bid', format: 'json', volumes: true,
+                ignoreFlats: true, retryCount: 2, failAfterRetryCount: true, batchSize: 7, pauseBetweenBatchesMs: 300
+              });
+              return { ok: true, n: d.length, first: d.length ? d[0].timestamp : null };
+            } catch (e) {
+              return { ok: false, err: ((e && e.name) || '') + ': ' + String((e && e.message) || e).replace(/[\r\n,]+/g, ' ').slice(0, 110) };
+            }
+          }
+          (async () => {
+            const out = ['id,claimed_start,known_m1,candles_first_7_days,first_candle_utc,candles_7_days_before,verdict,error'];
+            let consecutiveErr = 0, done = 0;
+            for (const it of list) {
+              const s = new Date(it.start + 'T00:00:00Z').getTime();
+              const a = await q(it.id, it.start, iso(s + 7 * day));
+              const b = await q(it.id, iso(s - 7 * day), it.start);
+              let verdict;
+              if (!a.ok || !b.ok) verdict = 'ERROR';
+              else if (b.n > 0) verdict = 'DATA_BEFORE_CLAIMED_START';
+              else if (a.n > 0) verdict = 'OK';
+              else verdict = 'NO_DATA_AT_START';
+              consecutiveErr = verdict === 'ERROR' ? consecutiveErr + 1 : 0;
+              out.push([it.id, it.start, it.known_m1, a.ok ? a.n : '', a.first ? new Date(a.first).toISOString() : '', b.ok ? b.n : '', verdict, (a.err || b.err || '')].join(','));
+              done++;
+              if (done % 25 === 0) { fs.writeFileSync('dukascopy_start_check.csv', out.join('\n') + '\n'); console.log('checked', done, 'of', list.length); }
+              if (consecutiveErr >= 10) { console.log('STOP: 10 errors in a row (blocked or rate-limited?) after', done, 'instruments'); break; }
+            }
+            fs.writeFileSync('dukascopy_start_check.csv', out.join('\n') + '\n');
+            const cnt = {}; out.slice(1).forEach((l) => { const v = l.split(',')[6]; cnt[v] = (cnt[v] || 0) + 1; });
+            console.log('verdicts:', JSON.stringify(cnt));
+            fs.writeFileSync('dukascopy_start_check_summary.txt', 'checked ' + done + ' of ' + list.length + ' instruments\nverdicts: ' + JSON.stringify(cnt) + '\n');
+          })();
+          JSEOF
+          node verify.js 2>&1 | tail -30
+
+      - name: Show in job summary and upload plain files to the release
+        run: |
+          {
+            echo '### Connection and speed test'
+            echo '```'
+            cat dukascopy_probe.txt || true
+            echo '```'
+            echo '### Plan'
+            echo '```'
+            cat dukascopy_plan_summary.txt
+            echo '```'
+            if [ -f dukascopy_start_check_summary.txt ]; then
+              echo '### Start check'
+              echo '```'
+              cat dukascopy_start_check_summary.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Dukascopy plan results (plain files, no zip)"
+          fi
+          FILES="dukascopy_plan.csv dukascopy_plan_summary.txt dukascopy_probe.txt dukascopy_probe.json dukascopy_meta_raw.json"
+          for f in dukascopy_start_check.csv dukascopy_start_check_summary.txt; do [ -f "$f" ] && FILES="$FILES $f"; done
+          gh release upload "$TAG" $FILES --clobber
