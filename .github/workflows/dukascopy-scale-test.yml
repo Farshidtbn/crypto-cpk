@@ -44,7 +44,7 @@ jobs:
           const vs = Object.entries(t).filter(([k]) => /^\d+\.\d+\.\d+$/.test(k)).sort((a, b) => (a[1] < b[1] ? -1 : 1));
           console.log('versions on npm:', vs.length, '| first:', vs[0].join(' '), '| last:', vs[vs.length - 1].join(' '));
           const pick = new Set();
-          for (const cut of ['2023-06-01', '2024-06-01', '2025-03-01']) { const c = vs.filter((x) => x[1] < cut); if (c.length) pick.add(c[c.length - 1][0]); }
+          for (const cut of ['2023-06-01', '2025-03-01', '2026-07-16']) { const c = vs.filter((x) => x[1] < cut); if (c.length) pick.add(c[c.length - 1][0]); }
           require('fs').writeFileSync('versions.txt', [...pick].join('\n') + '\n');
           console.log('picked:', [...pick].join(', '));
           JSEOF
@@ -113,7 +113,7 @@ jobs:
               table = json.load(open("table_" + open("best.txt").read().strip() + ".json"))
               day_ms = int(datetime.datetime(2025, 3, 4, tzinfo=datetime.timezone.utc).timestamp() * 1000)
               os.makedirs("mine", exist_ok=True)
-              for id_ in ["eurusd", "usdjpy", "xauusd", "xagusd", "btcusd", "ethusd", "brentcmdusd", "cocoacmdusd", "usa500idxusd", "deuidxeur", "dollaridxusd", "bundtreur", "usdczk", "aaplususd", "abibeeur"]:
+              for id_ in ["eurusd", "usdjpy", "xauusd", "xagusd", "btcusd", "ethusd", "brentcmdusd", "cocoacmdusd", "usa500idxusd", "deuidxeur", "dollaridxusd", "bundtreur", "usdczk", "aaplususd", "abibeeur", "gbpusd", "usdthb", "btceur", "cclgbgbx", "mapeseur", "lognchchf", "ipgususd", "spyususd"]:
                   df = (table.get(id_) or {}).get("df")
                   if not df: print(id_, "NO SCALE in table"); continue
                   st, b = get(id_.upper(), 2025, 3, 4, "BID")
