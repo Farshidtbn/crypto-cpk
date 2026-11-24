@@ -1,0 +1,187 @@
+name: dukascopy-pilot
+
+# PILOT (small, no form needed): one instrument, 3 months, Bid + Ask, 1-minute, from the OLD Dukascopy host, slow and gentle:
+#  1) FIRST checks the NEW host (standing rule: always try it first) and says whether the block is lifted
+#  2) downloads 91 days x Bid/Ask (about 180 requests, one at a time, 1.5 s apart, retry with waiting, failed ones are retried again later)
+#  3) builds the csv (time, bid_open..bid_close, ask_open..ask_close, bid_volume, ask_volume), packs it into .cpk and CHECKS it
+#  4) uploads the .cpk, a one-day csv sample and the report to the release "dukascopy-pilot" and prints the report in the run Summary
+# It needs candle_pack.py somewhere in the repo (the same file the crypto workflow uses).
+on:
+  workflow_dispatch:
+    inputs:
+      instrument:
+        description: "Instrument id (lower case)"
+        default: "xauusd"
+      date_from:
+        description: "First day (YYYY-MM-DD)"
+        default: "2025-01-01"
+      date_to:
+        description: "Last day (YYYY-MM-DD)"
+        default: "2025-03-31"
+
+permissions:
+  contents: write
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PILOT_INSTRUMENT: ${{ inputs.instrument || 'xauusd' }}
+      PILOT_FROM: ${{ inputs.date_from || '2025-01-01' }}
+      PILOT_TO: ${{ inputs.date_to || '2025-03-31' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Prepare (numpy, candle_pack.py, scale table)
+        run: |
+          pip install numpy 2>&1 | tail -1
+          CP=$(find . -name candle_pack.py -not -path "./node_modules/*" | head -1)
+          if [ -z "$CP" ]; then echo "candle_pack.py NOT FOUND in the repo - add it (https://github.com/${GITHUB_REPOSITORY}/new/main) and run again"; exit 1; fi
+          echo "CPDIR=$(dirname "$CP")" >> "$GITHUB_ENV"; echo "using $CP"
+          gh release download dukascopy-plan -p dukascopy_scale.csv --clobber
+          wc -l dukascopy_scale.csv
+
+      - name: 1) NEW host first (latest library)
+        continue-on-error: true
+        run: |
+          mkdir latest && cd latest && npm init -y >/dev/null && npm install dukascopy-node >/dev/null 2>&1
+          cat > new.js <<'JSEOF'
+          const { getHistoricalRates } = require('dukascopy-node');
+          getHistoricalRates({ instrument: process.env.PILOT_INSTRUMENT, dates: { from: '2025-03-04', to: '2025-03-05' }, timeframe: 'm1', priceType: 'bid', format: 'json', volumes: true, retryCount: 1, failAfterRetryCount: true })
+            .then((d) => { console.log('NEW HOST: OPEN,', d.length, 'candles  <-- block is lifted, tell the assistant'); })
+            .catch((e) => { console.log('NEW HOST: still BLOCKED -', ((e && e.name) || '') + ' ' + String((e && e.message) || e).slice(0, 60)); });
+          JSEOF
+          node new.js 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 2) Pilot download from the old host
+        run: |
+          cat > pilot.py <<'PYEOF'
+          # Pilot: one instrument, a few months, Bid + Ask, from the OLD Dukascopy host -> csv -> verified .cpk
+          import os, sys, io, csv, time, lzma, urllib.request, urllib.error, datetime, collections, statistics, json
+          import numpy as np
+          sys.path.insert(0, os.environ.get("CPDIR", "."))
+          import candle_pack as cp
+
+          INSTR = os.environ.get("PILOT_INSTRUMENT", "xauusd").strip().lower()
+          D0 = datetime.date.fromisoformat(os.environ.get("PILOT_FROM", "2025-01-01"))
+          D1 = datetime.date.fromisoformat(os.environ.get("PILOT_TO", "2025-03-31"))
+          PACE = float(os.environ.get("PILOT_PACE", "1.5"))            # seconds between requests
+          TRIES = int(os.environ.get("PILOT_TRIES", "6"))
+          BACKOFF = float(os.environ.get("PILOT_BACKOFF", "3"))
+          OUT = os.environ.get("PILOT_OUT", "out")
+          os.makedirs(OUT, exist_ok=True)
+
+          df = None
+          for r in csv.DictReader(open(os.environ.get("SCALE_CSV", "dukascopy_scale.csv"))):
+              if r["id"] == INSTR and r["decimalFactor"]: df = int(float(r["decimalFactor"]))
+          if not df: raise SystemExit(f"no scale (decimalFactor) for {INSTR}")
+          dec = len(str(df)) - 1                                       # 100000 -> 5 decimals, 1000 -> 3, 10 -> 1, 1 -> 0
+          print(f"{INSTR}: scale {df} -> {dec} decimals | {D0} .. {D1} | pace {PACE}s, up to {TRIES} tries")
+
+          DT = np.dtype([("t", ">u4"), ("o", ">u4"), ("c", ">u4"), ("l", ">u4"), ("h", ">u4"), ("v", ">f4")])
+          stats = {"requests": 0, "attempts": collections.Counter(), "http": collections.Counter(), "t0": time.time()}
+          blocked_run = 0
+
+
+          def fetch(day, side):
+              """-> ('ok', array) | ('nodata', None) | ('fail', reason). month in the URL is 0-based."""
+              global blocked_run
+              url = f"https://datafeed.dukascopy.com/datafeed/{INSTR.upper()}/{day.year}/{day.month - 1:02d}/{day.day:02d}/{side}_candles_min_1.bi5"
+              reason = ""
+              for k in range(TRIES):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30)
+                      b = r.read(); stats["http"][200] += 1
+                      if not b: stats["attempts"][k + 1] += 1; return "nodata", None
+                      raw = lzma.decompress(b)
+                      if len(raw) % 24: raise ValueError("size not multiple of 24")
+                      blocked_run = 0; stats["attempts"][k + 1] += 1
+                      return "ok", np.frombuffer(raw, dtype=DT)
+                  except urllib.error.HTTPError as e:
+                      stats["http"][e.code] += 1; reason = f"HTTP {e.code}"
+                      if e.code == 404: stats["attempts"][k + 1] += 1; blocked_run = 0; return "nodata", None
+                      if e.code in (403, 429): blocked_run += 1
+                  except Exception as e:
+                      reason = type(e).__name__ + ":" + str(e)[:40]; stats["http"]["err"] += 1
+                  time.sleep(BACKOFF * (k + 1))
+                  if blocked_run >= 12: break
+              stats["attempts"]["fail"] += 1
+              return "fail", reason
+
+
+          days = [D0 + datetime.timedelta(days=i) for i in range((D1 - D0).days + 1)]
+          res = {}                                                     # (day, side) -> array | None(nodata)
+          todo = [(d, s) for d in days for s in ("BID", "ASK")]
+          for rnd in range(3):
+              left = []
+              for d, s in todo:
+                  st, x = fetch(d, s); stats["requests"] += 1
+                  if st == "ok": res[(d, s)] = x
+                  elif st == "nodata": res[(d, s)] = None
+                  else: left.append((d, s))
+                  time.sleep(PACE)
+                  if blocked_run >= 12: break
+              print(f"round {rnd + 1}: {len(todo) - len(left)} of {len(todo)} done, {len(left)} failed, {time.time() - stats['t0']:.0f} s so far")
+              todo = left
+              if not todo or blocked_run >= 12: break
+              time.sleep(60)
+          failed = todo
+          if blocked_run >= 12: print("STOPPED: 12 refusals (403/429) in a row - looks like a block")
+
+          rows = []; one_side = []; mism = 0; daycount = {}
+          for d in days:
+              b, a = res.get((d, "BID")), res.get((d, "ASK"))
+              if b is None and a is None: continue
+              if b is None or a is None: one_side.append(str(d)); continue
+              ep = int(datetime.datetime(d.year, d.month, d.day, tzinfo=datetime.timezone.utc).timestamp())
+              bm = {int(r["t"]): r for r in b}; am = {int(r["t"]): r for r in a}
+              common = sorted(set(bm) & set(am)); mism += len(set(bm) ^ set(am)); daycount[str(d)] = len(common)
+              f = lambda q: f"{q / df:.{dec}f}"
+              for t in common:
+                  x, y = bm[t], am[t]
+                  rows.append([ep + t, f(int(x["o"])), f(int(x["h"])), f(int(x["l"])), f(int(x["c"])), f(int(y["o"])), f(int(y["h"])), f(int(y["l"])), f(int(y["c"])),
+                               f"{round(float(x['v']), 2):.2f}", f"{round(float(y['v']), 2):.2f}"])
+          HEAD = ["time", "bid_open", "bid_high", "bid_low", "bid_close", "ask_open", "ask_high", "ask_low", "ask_close", "bid_volume", "ask_volume"]
+          rep = [f"PILOT {INSTR} {D0}..{D1} (old host, Bid+Ask, scale {df})"]
+          if not rows:
+              rep.append("NO ROWS produced"); open(f"{OUT}/pilot_report.txt", "w").write("\n".join(rep) + "\n"); print("\n".join(rep)); raise SystemExit(1)
+          buf = io.StringIO(); w = csv.writer(buf, lineterminator="\n"); w.writerow(HEAD); w.writerows(rows); data = buf.getvalue().encode()
+          names, cols, unit = cp.read_one(INSTR, data)
+          blob = cp.encode(names, cols, unit)
+          n2, c2, u2 = cp.decode(blob)
+          ok_pack = n2 == names and u2 == unit and cp.same(cols, c2, names)
+          txt = list(csv.reader(io.StringIO(data.decode())))[1:]                                            # text cell == decoded number, every cell
+          ok_cells = all(np.array_equal(np.array([float(r[i]) for r in txt]), c2[names[i]]) for i in range(len(names)))
+          name = f"{INSTR}-1m-pilot.cpk"; open(f"{OUT}/{name}", "wb").write(blob)
+          first = [r for r in rows if r[0] < rows[0][0] + 86400][:1440]
+          open(f"{OUT}/{INSTR}-first-day-sample.csv", "w").write(",".join(HEAD) + "\n" + "\n".join(",".join(map(str, r)) for r in first) + "\n")
+          ts = np.array([r[0] for r in rows]); sp = np.array([float(r[8]) - float(r[4]) for r in rows])
+          hi_ok = np.mean([float(r[2]) >= max(float(r[1]), float(r[4])) and float(r[3]) <= min(float(r[1]), float(r[4])) for r in rows])
+          el = time.time() - stats["t0"]
+          rep += [f"days asked {len(days)} | days with both sides {len(daycount)} | one side only {len(one_side)} {one_side[:5]} | requests failed for good {len(failed)} {[str(d)+s for d, s in failed[:8]]}",
+                  f"candles {len(rows):,} | time strictly increasing {bool(np.all(np.diff(ts) > 0))} | Bid-only/Ask-only timestamps (not merged) {mism}",
+                  f"candles per day: min {min(daycount.values())} median {int(statistics.median(daycount.values()))} max {max(daycount.values())} | days under 1440: {sum(1 for v in daycount.values() if v < 1440)}",
+                  f"first {datetime.datetime.fromtimestamp(rows[0][0], datetime.timezone.utc):%Y-%m-%d %H:%M} last {datetime.datetime.fromtimestamp(rows[-1][0], datetime.timezone.utc):%Y-%m-%d %H:%M} UTC",
+                  f"spread (ask_close - bid_close): min {sp.min():.{dec}f} median {np.median(sp):.{dec}f} max {sp.max():.{dec}f} | ask < bid in {int((sp < 0).sum())} candles | OHLC consistent in {100 * hi_ok:.2f} % of candles",
+                  f"first candle: {rows[0]}", f"last candle: {rows[-1]}",
+                  f"PACK: csv {len(data):,} B -> .cpk {len(blob):,} B ({100 - 100 * len(blob) / len(data):.0f} % smaller) | decode identical (64 bit) {ok_pack} | every text cell equals decoded number {ok_cells}",
+                  f"NETWORK: requests {stats['requests']} (incl. retry rounds) | http answers {dict(stats['http'])} | attempts per request (1 = first try) {dict(sorted(stats['attempts'].items(), key=lambda x: str(x[0])))}",
+                  f"time {el:.0f} s = {el / max(1, stats['requests']):.1f} s per request | volumes rounded to 2 decimals (like the library output)"]
+          open(f"{OUT}/pilot_report.txt", "w").write("\n".join(rep) + "\n"); print("\n".join(rep))
+          if not (ok_pack and ok_cells): raise SystemExit(2)
+          PYEOF
+          python3 pilot.py 2>&1 | tee pilot_log.txt
+          { echo '### Pilot report'; echo '```'; cat out/pilot_report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 3) Upload results to the release dukascopy-pilot
+        if: always()
+        run: |
+          [ -d out ] || exit 0
+          gh release view dukascopy-pilot >/dev/null 2>&1 || gh release create dukascopy-pilot --title dukascopy-pilot --notes "Dukascopy pilot results"
+          gh release upload dukascopy-pilot out/* --clobber
