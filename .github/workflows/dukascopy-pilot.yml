@@ -1,8 +1,8 @@
 name: dukascopy-pilot
 
-# PILOT (small, no form needed): one instrument, 3 months, Bid + Ask, 1-minute, from the OLD Dukascopy host, slow and gentle:
+# PILOT (small, no form needed): one instrument, 1 month, Bid + Ask, 1-minute, from the OLD Dukascopy host, slow and gentle:
 #  1) FIRST checks the NEW host (standing rule: always try it first) and says whether the block is lifted
-#  2) downloads 91 days x Bid/Ask (about 180 requests, one at a time, 1.5 s apart, retry with waiting, failed ones are retried again later)
+#  2) downloads 31 days x Bid/Ask (62 requests, one at a time, 1.5 s apart, retry with waiting, failed ones are retried again later)
 #  3) builds the csv (time, bid_open..bid_close, ask_open..ask_close, bid_volume, ask_volume), packs it into .cpk and CHECKS it
 #  4) uploads the .cpk, a one-day csv sample and the report to the release "dukascopy-pilot" and prints the report in the run Summary
 # It needs candle_pack.py somewhere in the repo (the same file the crypto workflow uses).
@@ -17,7 +17,10 @@ on:
         default: "2025-01-01"
       date_to:
         description: "Last day (YYYY-MM-DD)"
-        default: "2025-03-31"
+        default: "2025-01-31"
+      max_minutes:
+        description: "Time budget in minutes (the pilot stops and reports what it has)"
+        default: "40"
 
 permissions:
   contents: write
@@ -25,13 +28,14 @@ permissions:
 jobs:
   pilot:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 75
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       PILOT_INSTRUMENT: ${{ inputs.instrument || 'xauusd' }}
       PILOT_FROM: ${{ inputs.date_from || '2025-01-01' }}
-      PILOT_TO: ${{ inputs.date_to || '2025-03-31' }}
+      PILOT_TO: ${{ inputs.date_to || '2025-01-31' }}
+      PILOT_MAX_MIN: ${{ inputs.max_minutes || '40' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -72,8 +76,10 @@ jobs:
           D0 = datetime.date.fromisoformat(os.environ.get("PILOT_FROM", "2025-01-01"))
           D1 = datetime.date.fromisoformat(os.environ.get("PILOT_TO", "2025-03-31"))
           PACE = float(os.environ.get("PILOT_PACE", "1.5"))            # seconds between requests
-          TRIES = int(os.environ.get("PILOT_TRIES", "6"))
-          BACKOFF = float(os.environ.get("PILOT_BACKOFF", "3"))
+          TRIES = int(os.environ.get("PILOT_TRIES", "4"))
+          BACKOFF = float(os.environ.get("PILOT_BACKOFF", "2"))
+          MAXMIN = float(os.environ.get("PILOT_MAX_MIN", "40"))       # time budget: after this the pilot stops and reports what it has
+          TMO = float(os.environ.get("PILOT_TIMEOUT", "20"))
           OUT = os.environ.get("PILOT_OUT", "out")
           os.makedirs(OUT, exist_ok=True)
 
@@ -85,6 +91,8 @@ jobs:
           print(f"{INSTR}: scale {df} -> {dec} decimals | {D0} .. {D1} | pace {PACE}s, up to {TRIES} tries")
 
           DT = np.dtype([("t", ">u4"), ("o", ">u4"), ("c", ">u4"), ("l", ">u4"), ("h", ">u4"), ("v", ">f4")])
+          DEADLINE = time.time() + MAXMIN * 60
+          stopped = ""
           stats = {"requests": 0, "attempts": collections.Counter(), "http": collections.Counter(), "t0": time.time()}
           blocked_run = 0
 
@@ -96,7 +104,7 @@ jobs:
               reason = ""
               for k in range(TRIES):
                   try:
-                      r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30)
+                      r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=TMO)
                       b = r.read(); stats["http"][200] += 1
                       if not b: stats["attempts"][k + 1] += 1; return "nodata", None
                       raw = lzma.decompress(b)
@@ -121,7 +129,11 @@ jobs:
           for rnd in range(3):
               left = []
               for d, s in todo:
-                  st, x = fetch(d, s); stats["requests"] += 1
+                  if time.time() > DEADLINE: stopped = f"time budget of {MAXMIN:g} min used up"; break
+                  t1 = time.time(); st, x = fetch(d, s); stats["requests"] += 1
+                  print(f"{d} {s} -> {st}" + (f" ({x})" if st == 'fail' else "") + f" | {time.time() - t1:.1f} s | http so far {dict(stats['http'])} | total {time.time() - stats['t0']:.0f} s", flush=True)
+                  if stats["requests"] >= 12 and not any(v is not None for v in res.values()) and not stats["attempts"].get(1) and sum(1 for k in stats["attempts"] if k != "fail") == 0:
+                      stopped = "no request succeeded in the first 12 - the old host does not answer; stopping early"; break
                   if st == "ok": res[(d, s)] = x
                   elif st == "nodata": res[(d, s)] = None
                   else: left.append((d, s))
@@ -130,9 +142,11 @@ jobs:
               print(f"round {rnd + 1}: {len(todo) - len(left)} of {len(todo)} done, {len(left)} failed, {time.time() - stats['t0']:.0f} s so far")
               todo = left
               if not todo or blocked_run >= 12: break
+              if stopped: break
               time.sleep(60)
           failed = todo
-          if blocked_run >= 12: print("STOPPED: 12 refusals (403/429) in a row - looks like a block")
+          if blocked_run >= 12: stopped = "12 refusals (403/429) in a row - looks like a block"
+          if stopped: print("STOPPED:", stopped, flush=True)
 
           rows = []; one_side = []; mism = 0; daycount = {}
           for d in days:
@@ -149,8 +163,9 @@ jobs:
                                f"{round(float(x['v']), 2):.2f}", f"{round(float(y['v']), 2):.2f}"])
           HEAD = ["time", "bid_open", "bid_high", "bid_low", "bid_close", "ask_open", "ask_high", "ask_low", "ask_close", "bid_volume", "ask_volume"]
           rep = [f"PILOT {INSTR} {D0}..{D1} (old host, Bid+Ask, scale {df})"]
+          if stopped: rep.append("STOPPED EARLY: " + stopped)
           if not rows:
-              rep.append("NO ROWS produced"); open(f"{OUT}/pilot_report.txt", "w").write("\n".join(rep) + "\n"); print("\n".join(rep)); raise SystemExit(1)
+              rep.append("NO ROWS produced"); rep.append(f"NETWORK: requests {stats['requests']} | http answers {dict(stats['http'])} | attempts {dict(stats['attempts'])} | {time.time() - stats['t0']:.0f} s"); open(f"{OUT}/pilot_report.txt", "w").write("\n".join(rep) + "\n"); print("\n".join(rep)); raise SystemExit(1)
           buf = io.StringIO(); w = csv.writer(buf, lineterminator="\n"); w.writerow(HEAD); w.writerows(rows); data = buf.getvalue().encode()
           names, cols, unit = cp.read_one(INSTR, data)
           blob = cp.encode(names, cols, unit)
@@ -176,12 +191,17 @@ jobs:
           open(f"{OUT}/pilot_report.txt", "w").write("\n".join(rep) + "\n"); print("\n".join(rep))
           if not (ok_pack and ok_cells): raise SystemExit(2)
           PYEOF
-          python3 pilot.py 2>&1 | tee pilot_log.txt
-          { echo '### Pilot report'; echo '```'; cat out/pilot_report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p out
+          python3 -u pilot.py 2>&1 | tee out/pilot_log.txt
+
+      - name: Report in the run Summary
+        if: always()
+        run: |
+          { echo '### Pilot report'; echo '```'; cat out/pilot_report.txt 2>/dev/null || echo "(no report was written)"; echo '```'; echo '### last log lines'; echo '```'; tail -n 25 out/pilot_log.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 3) Upload results to the release dukascopy-pilot
         if: always()
         run: |
-          [ -d out ] || exit 0
+          ls out/* >/dev/null 2>&1 || { echo "nothing to upload"; exit 0; }
           gh release view dukascopy-pilot >/dev/null 2>&1 || gh release create dukascopy-pilot --title dukascopy-pilot --notes "Dukascopy pilot results"
           gh release upload dukascopy-pilot out/* --clobber
