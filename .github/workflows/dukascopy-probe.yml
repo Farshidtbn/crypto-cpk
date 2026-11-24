@@ -1,10 +1,8 @@
 name: dukascopy-probe
 
-# Tiny test, no form. Runs by hand and every 6 hours.
-#  1) the NEW host (jetta, behind a bot challenge): green/red history
-#  2) the OLD official file host (datafeed.dukascopy.com): does it return REAL 1-minute candles? decoded and shown
-#  3) a gentle burst of 40 requests to the old host to see if it starts refusing (429/403)
-# The run is RED only when BOTH hosts fail.
+# Tiny test, no form.
+#  - every 6 hours (automatic): new host (library) + ONE quick check of the old official host. RED only if both fail.
+#  - by hand (Run workflow): additionally a SLOW pacing test (30 requests, 3 s apart, retry on 503) and a name test of the old host.
 on:
   workflow_dispatch:
   schedule:
@@ -16,7 +14,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -34,7 +32,7 @@ jobs:
           const { getHistoricalRates } = require('dukascopy-node');
           (async () => {
             let ok = 0;
-            for (const id of ['eurusd', 'xauusd', 'usa500idxusd']) {
+            for (const id of ['eurusd', 'xauusd']) {
               try {
                 const d = await getHistoricalRates({ instrument: id, dates: { from: '2025-03-03', to: '2025-03-04' }, timeframe: 'm1', priceType: 'bid', format: 'json', volumes: true, retryCount: 1, failAfterRetryCount: true });
                 console.log('library', id, 'OK', d.length, 'candles'); ok++;
@@ -45,52 +43,88 @@ jobs:
           JSEOF
           node p.js 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"; exit ${PIPESTATUS[0]}
 
-      - name: Test old host - decode real candles
-        id: oldhost
+      - name: Old host - one quick check against the library's own known candle
+        id: oldquick
         continue-on-error: true
         run: |
-          cat > old.py <<'PYEOF'
-          import urllib.request, lzma, struct, sys, datetime, time
-          # month in the URL is 0-based (00 = January). Candle record = 24 bytes big-endian: seconds-from-midnight, open, close, low, high (int, price*1e5 or 1e3), volume (float32)
-          def get(sym, y, m, d, side):
-              url = f"https://datafeed.dukascopy.com/datafeed/{sym}/{y}/{m-1:02d}/{d:02d}/{side}_candles_min_1.bi5"
-              try:
-                  r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30)
-                  return r.status, r.read()
-              except urllib.error.HTTPError as e:
-                  return e.code, b""
-              except Exception as e:
-                  return str(e)[:60], b""
-          good = 0
-          for sym, y, m, d in [("EURUSD", 2025, 3, 3), ("XAUUSD", 2025, 3, 3), ("USA500IDXUSD", 2025, 3, 3), ("EURUSD", 2012, 1, 4), ("BTCUSD", 2025, 3, 3), ("BRENTCMDUSD", 2025, 3, 3)]:
-              for side in ("BID", "ASK"):
-                  st, b = get(sym, y, m, d, side)
-                  info = ""
-                  if st == 200 and b:
-                      try:
-                          raw = lzma.decompress(b)
-                          n = len(raw) // 24
-                          t, o, c, l, h, v = struct.unpack(">IIIIIf", raw[:24])
-                          t2, o2, c2, l2, h2, v2 = struct.unpack(">IIIIIf", raw[(n - 1) * 24:n * 24])
-                          info = f"candles={n} (multiple of 24: {len(raw) % 24 == 0}) first: {t // 3600:02d}:{t % 3600 // 60:02d} o={o} h={h} l={l} c={c} vol={v:.2f} | last: {t2 // 3600:02d}:{t2 % 3600 // 60:02d} c={c2}"
-                          good += 1
-                      except Exception as e:
-                          info = "NOT valid candle data: " + str(e)[:50] + " | starts: " + repr(b[:40])
-                  print(f"{sym} {y}-{m:02d}-{d:02d} {side}: HTTP {st}, {len(b)} bytes {info}")
-                  time.sleep(0.5)
-          print("old host valid files:", good)
-          # gentle burst: 40 daily files, 0.3 s pause
-          codes = {}
-          day = datetime.date(2025, 1, 2)
-          for i in range(40):
-              st, b = get("EURUSD", day.year, day.month, day.day, "BID"); codes[st] = codes.get(st, 0) + 1
-              day += datetime.timedelta(days=1); time.sleep(0.3)
-          print("burst of 40 (status: count):", codes, "(weekends may give 404/empty, that is normal)")
-          sys.exit(0 if good else 1)
+          cat > oldlib.py <<'PYEOF'
+          import urllib.request, urllib.error, lzma, struct, time, sys
+          def get(sym, y, m, d, side, tries=6):
+              url = f"https://datafeed.dukascopy.com/datafeed/{sym}/{y}/{m-1:02d}/{d:02d}/{side}_candles_min_1.bi5"   # month is 0-based
+              st = None
+              for k in range(tries):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30)
+                      return r.status, r.read(), k + 1
+                  except urllib.error.HTTPError as e:
+                      st = e.code
+                      if e.code in (404, 403): return st, b"", k + 1
+                  except Exception as e:
+                      st = str(e)[:40]
+                  time.sleep(4 * (k + 1))
+              return st, b"", tries
+          if __name__ == "__main__":
+              st, b, n = get("EURUSD", 2025, 3, 3, "BID")
+              print(f"EURUSD BID 2025-03-03: HTTP {st}, {len(b)} bytes, attempts {n}")
+              if st != 200 or not b: sys.exit(1)
+              raw = lzma.decompress(b); k = len(raw) // 24
+              t, o, c, l, h, v = struct.unpack(">IIIIIf", raw[:24])
+              print(f"candles {k}; first: o={o/1e5:.5f} h={h/1e5:.5f} l={l/1e5:.5f} c={c/1e5:.5f} vol={v:.2f}")
+              print("library had (run #1-#6): o=1.04119 h=1.04120 l=1.04087 c=1.04096 vol=201.03")
+              same = (o, h, l, c) == (104119, 104120, 104087, 104096) and abs(v - 201.03) < 0.01
+              print("RESULT: old host candle MATCHES the library candle" if same else "RESULT: differs from library candle (see numbers)")
           PYEOF
-          python3 old.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"; exit ${PIPESTATUS[0]}
+          python3 oldlib.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"; exit ${PIPESTATUS[0]}
+
+      - name: Old host - slow pacing test (manual run only)
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        run: |
+          cat > pace.py <<'PYEOF'
+          import datetime, time, collections
+          from oldlib import get
+          day = datetime.date(2025, 1, 6)       # a Monday
+          att = collections.Counter(); fails = 0; t0 = time.time(); n = 0
+          while n < 30:
+              if day.weekday() < 5:
+                  st, b, k = get("EURUSD", day.year, day.month, day.day, "BID", tries=4)
+                  att[k if st == 200 else "fail"] += 1; fails += st != 200; n += 1
+                  time.sleep(3)
+              day += datetime.timedelta(days=1)
+          print(f"30 weekday files, 3 s apart, up to 4 attempts each: attempts needed (1=first try ok) {dict(att)}; failed after retries: {fails}; total {time.time() - t0:.0f} s")
+          PYEOF
+          python3 pace.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Old host - instrument names (manual run only)
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        run: |
+          cat > names.js <<'JSEOF'
+          const d = require('dukascopy-node'); const m = d.instrumentMetaData || {};
+          const want = ['xagusd','gbpusd','usdczk','aaplususd','spyususd','abibeeur','bundtreur','cocoacmdusd','dollaridxusd','ethusd','deuidxeur','usa500idxusd','brentcmdusd'];
+          const out = [];
+          for (const id of want) { const v = m[id]; if (v) out.push({ id, code: v.code || '', start: v.startDayForMinuteCandles || '' }); }
+          require('fs').writeFileSync('names.json', JSON.stringify(out));
+          JSEOF
+          node names.js
+          cat > names.py <<'PYEOF'
+          import json, re, time
+          from oldlib import get
+          for it in json.load(open("names.json")):
+              code = it["code"]
+              cands = []
+              for c in (it["id"].upper(), re.sub(r"[^A-Za-z0-9]", "", code).upper(), code.replace("/", "").upper(), code.replace("-", "").replace("/", "").upper()):
+                  if c and c not in cands: cands.append(c)
+              res = []
+              for c in cands:
+                  st, b, k = get(c, 2025, 3, 4, "BID", tries=3)          # a Tuesday
+                  res.append(f"{c}:{st}/{len(b)}B"); time.sleep(2)
+                  if st == 200 and b: break
+              print(it["id"], "| code", code, "|", " ".join(res))
+          PYEOF
+          python3 names.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Result
         run: |
-          echo "new host: ${{ steps.newhost.outcome }} | old host: ${{ steps.oldhost.outcome }}" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.newhost.outcome }}" != "success" ] && [ "${{ steps.oldhost.outcome }}" != "success" ]; then exit 1; fi
+          echo "new host: ${{ steps.newhost.outcome }} | old host: ${{ steps.oldquick.outcome }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.newhost.outcome }}" != "success" ] && [ "${{ steps.oldquick.outcome }}" != "success" ]; then exit 1; fi
