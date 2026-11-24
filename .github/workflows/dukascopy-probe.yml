@@ -20,9 +20,13 @@ jobs:
         run: npm install dukascopy-node && npm ls dukascopy-node
       - name: Probe
         run: |
-          echo "runner public IP: $(curl -s https://api.ipify.org)"
-          echo "--- raw request (month in the URL is 0-based: 2 = March)"
-          curl -s -o /dev/null -D - "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/BID/2025/2/3" | head -12
+          {
+            echo "runner public IP: $(curl -s https://api.ipify.org)"
+            echo "--- A) new host jetta (what the library uses)"
+            curl -s -D - -o /tmp/a.txt "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/BID/2025/3/3" | head -15; head -c 300 /tmp/a.txt; echo
+            echo "--- B) old official datafeed host (month is 0-based: 02 = March)"
+            curl -s -D - -o /tmp/b.bin "https://datafeed.dukascopy.com/datafeed/EURUSD/2025/02/03/BID_candles_min_1.bi5" | head -12; echo "bytes: $(wc -c < /tmp/b.bin)"
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           cat > p.js <<'JSEOF'
           const { getHistoricalRates } = require('dukascopy-node');
           (async () => {
