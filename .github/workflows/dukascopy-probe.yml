@@ -1,9 +1,12 @@
 name: dukascopy-probe
 
 # Tiny test, no form: is Dukascopy answering GitHub's servers right now?
-# Prints the runner's public IP, the raw HTTP status of one daily file, and the dukascopy-node result for 3 instruments.
+#  - runs by hand (Run workflow) AND automatically every 6 hours
+#  - the run is GREEN when at least one instrument answered, RED when all were refused  -> the Actions list becomes a history of "blocked / open"
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
 
 permissions:
   contents: read
@@ -21,21 +24,24 @@ jobs:
       - name: Probe
         run: |
           {
-            echo "runner public IP: $(curl -s https://api.ipify.org)"
+            echo "time: $(date -u +%FT%TZ) | runner public IP: $(curl -s -m 15 https://api.ipify.org)"
             echo "--- A) new host jetta (what the library uses)"
-            curl -s -D - -o /tmp/a.txt "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/BID/2025/3/3" | head -15; head -c 300 /tmp/a.txt; echo
-            echo "--- B) old official datafeed host (month is 0-based: 02 = March)"
-            curl -s -D - -o /tmp/b.bin "https://datafeed.dukascopy.com/datafeed/EURUSD/2025/02/03/BID_candles_min_1.bi5" | head -12; echo "bytes: $(wc -c < /tmp/b.bin)"
+            curl -s -m 30 -D - -o /tmp/a.txt "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/BID/2025/3/3" | grep -i -E "^HTTP|x-amzn-waf|server" ; echo "curl exit: $?"
+            echo "--- B) old official host (month is 0-based: 02 = March)"
+            code=$(curl -s -m 30 -o /tmp/b.bin -w "%{http_code}" "https://datafeed.dukascopy.com/datafeed/EURUSD/2025/02/03/BID_candles_min_1.bi5"); echo "HTTP $code | bytes: $(wc -c < /tmp/b.bin 2>/dev/null)"
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           cat > p.js <<'JSEOF'
           const { getHistoricalRates } = require('dukascopy-node');
           (async () => {
+            let ok = 0;
             for (const id of ['eurusd', 'xauusd', 'usa500idxusd']) {
               try {
                 const d = await getHistoricalRates({ instrument: id, dates: { from: '2025-03-03', to: '2025-03-04' }, timeframe: 'm1', priceType: 'bid', format: 'json', volumes: true, retryCount: 1, failAfterRetryCount: true });
-                console.log(id, 'OK', d.length, 'candles');
-              } catch (e) { console.log(id, 'FAIL', (e && e.name) + ': ' + String((e && e.message) || e).slice(0, 160)); }
+                console.log(id, 'OK', d.length, 'candles'); ok++;
+              } catch (e) { console.log(id, 'FAIL', (e && e.name) + ': ' + String((e && e.message) || e).slice(0, 100)); }
             }
+            console.log(ok ? 'RESULT: OPEN (' + ok + ' of 3 answered)' : 'RESULT: BLOCKED (all 3 refused)');
+            process.exit(ok ? 0 : 1);
           })();
           JSEOF
-          node p.js 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          node p.js 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"; exit ${PIPESTATUS[0]}
