@@ -51,7 +51,13 @@ jobs:
           node pick.js | tee -a "$GITHUB_STEP_SUMMARY"
           cat > dump.js <<'JSEOF'
           const dir = process.argv[2], ver = process.argv[3];
-          const m = require(dir + '/node_modules/dukascopy-node').instrumentMetaData || {};
+          const fs = require('fs'); const base = dir + '/node_modules/dukascopy-node/dist/';
+          let m = require(dir + '/node_modules/dukascopy-node').instrumentMetaData;
+          if (!m) {                                                      // older versions keep the table inside the bundle but do not export it: expose it
+            try { fs.writeFileSync(base + 'index_patched.js', fs.readFileSync(base + 'index.js', 'utf8') + '\nmodule.exports.instrumentMetaData = instrumentMetaData;\n'); m = require(base + 'index_patched.js').instrumentMetaData; }
+            catch (e) { console.log('version', ver, 'patch failed:', String(e.message).slice(0, 100)); }
+          }
+          m = m || {};
           const items = Array.isArray(m) ? m.map((v) => [v.id || v.instrument, v]) : Object.entries(m);
           const table = {}; let withDf = 0; const keys = new Set();
           for (const [k, v] of items) { if (!v || typeof v !== 'object') continue; Object.keys(v).forEach((x) => keys.add(x));
