@@ -19,11 +19,11 @@ on:
         description: "Last day (YYYY-MM-DD)"
         default: "2025-01-31"
       workers:
-        description: "Parallel requests (1 = one at a time; try 3 only after a normal run)"
-        default: "1"
+        description: "Parallel requests (1 = one at a time). This test uses 3 to see whether the speed scales."
+        default: "3"
       max_minutes:
         description: "Time budget in minutes (the pilot stops and reports what it has)"
-        default: "40"
+        default: "45"
 
 permissions:
   contents: write
@@ -38,8 +38,8 @@ jobs:
       PILOT_INSTRUMENT: ${{ inputs.instrument || 'xauusd' }}
       PILOT_FROM: ${{ inputs.date_from || '2025-01-01' }}
       PILOT_TO: ${{ inputs.date_to || '2025-01-31' }}
-      PILOT_MAX_MIN: ${{ inputs.max_minutes || '40' }}
-      PILOT_WORKERS: ${{ inputs.workers || '1' }}
+      PILOT_MAX_MIN: ${{ inputs.max_minutes || '45' }}
+      PILOT_WORKERS: ${{ inputs.workers || '3' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -167,7 +167,6 @@ jobs:
               todo = left
               if not todo or blocked_run >= 12 or stopped or time.time() > DEADLINE: break
               time.sleep(60)
-          failed = todo
           # a weekday with only ONE side (or none) is suspicious: the host may answer 404 / empty when it is overloaded -> ask again, up to 2 more times
           for rc in range(2):
               sus = []
@@ -179,12 +178,14 @@ jobs:
               if not sus or stopped or time.time() > DEADLINE: break
               print(f"recheck {rc + 1}: {len(sus)} requests for weekdays with a missing side", flush=True)
               run(sus, "recheck ")
+          failed = [(d, s) for d in days for s in ("BID", "ASK") if (d, s) not in res]         # never downloaded (failed for good or cut by the time budget)
           if blocked_run >= 12: stopped = "12 refusals (403/429) in a row - looks like a block"
           if time.time() > DEADLINE and not stopped: stopped = f"time budget of {MAXMIN:g} min used up"
           if stopped: print("STOPPED:", stopped, flush=True)
 
-          rows = []; one_side = []; mism = 0; daycount = {}
+          rows = []; one_side = []; incomplete = []; mism = 0; daycount = {}
           for d in days:
+              if (d, "BID") not in res or (d, "ASK") not in res: incomplete.append(str(d)); continue          # a side was never downloaded: NOT the same as 'no data'
               b, a = res.get((d, "BID")), res.get((d, "ASK"))
               if b is None and a is None: continue
               if b is None or a is None: one_side.append(str(d)); continue
@@ -214,7 +215,7 @@ jobs:
           ts = np.array([r[0] for r in rows]); sp = np.array([float(r[8]) - float(r[4]) for r in rows])
           hi_ok = np.mean([float(r[2]) >= max(float(r[1]), float(r[4])) and float(r[3]) <= min(float(r[1]), float(r[4])) for r in rows])
           el = time.time() - stats["t0"]
-          rep += [f"days asked {len(days)} | days with both sides {len(daycount)} | one side only {len(one_side)} {one_side} | requests failed for good {len(failed)} {[str(d)+s for d, s in failed[:8]]}",
+          rep += [f"days asked {len(days)} | days with both sides {len(daycount)} | days where the host answered 'no data' for only ONE side {len(one_side)} {one_side} | NEVER DOWNLOADED (failed or cut by the time budget): {len(failed)} requests, {len(incomplete)} days {incomplete}",
                   "reasons for missing sides (day side: answers seen): " + "; ".join(f"{d} {s}: {','.join(v)}" for (d, s), v in sorted(nodata_why.items()) if d.weekday() < 5) [:900],
                   f"candles {len(rows):,} | time strictly increasing {bool(np.all(np.diff(ts) > 0))} | Bid-only/Ask-only timestamps (not merged) {mism}",
                   f"candles per day: min {min(daycount.values())} median {int(statistics.median(daycount.values()))} max {max(daycount.values())} | days under 1440: {sum(1 for v in daycount.values() if v < 1440)}",
