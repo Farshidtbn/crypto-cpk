@@ -18,6 +18,9 @@ on:
       date_to:
         description: "Last day (YYYY-MM-DD)"
         default: "2025-01-31"
+      workers:
+        description: "Parallel requests (1 = one at a time; try 3 only after a normal run)"
+        default: "1"
       max_minutes:
         description: "Time budget in minutes (the pilot stops and reports what it has)"
         default: "40"
@@ -36,6 +39,7 @@ jobs:
       PILOT_FROM: ${{ inputs.date_from || '2025-01-01' }}
       PILOT_TO: ${{ inputs.date_to || '2025-01-31' }}
       PILOT_MAX_MIN: ${{ inputs.max_minutes || '40' }}
+      PILOT_WORKERS: ${{ inputs.workers || '1' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -98,7 +102,7 @@ jobs:
 
 
           def fetch(day, side):
-              """-> ('ok', array) | ('nodata', None) | ('fail', reason). month in the URL is 0-based."""
+              """-> ('ok', array) | ('nodata', '404' | 'empty 200') | ('fail', reason). month in the URL is 0-based."""
               global blocked_run
               url = f"https://datafeed.dukascopy.com/datafeed/{INSTR.upper()}/{day.year}/{day.month - 1:02d}/{day.day:02d}/{side}_candles_min_1.bi5"
               reason = ""
@@ -106,14 +110,14 @@ jobs:
                   try:
                       r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=TMO)
                       b = r.read(); stats["http"][200] += 1
-                      if not b: stats["attempts"][k + 1] += 1; return "nodata", None
+                      if not b: stats["attempts"][k + 1] += 1; return "nodata", "empty 200"
                       raw = lzma.decompress(b)
                       if len(raw) % 24: raise ValueError("size not multiple of 24")
                       blocked_run = 0; stats["attempts"][k + 1] += 1
                       return "ok", np.frombuffer(raw, dtype=DT)
                   except urllib.error.HTTPError as e:
                       stats["http"][e.code] += 1; reason = f"HTTP {e.code}"
-                      if e.code == 404: stats["attempts"][k + 1] += 1; blocked_run = 0; return "nodata", None
+                      if e.code == 404: stats["attempts"][k + 1] += 1; blocked_run = 0; return "nodata", "404"
                       if e.code in (403, 429): blocked_run += 1
                   except Exception as e:
                       reason = type(e).__name__ + ":" + str(e)[:40]; stats["http"]["err"] += 1
@@ -123,29 +127,60 @@ jobs:
               return "fail", reason
 
 
+          import threading
+          from concurrent.futures import ThreadPoolExecutor
+          WORKERS = int(os.environ.get("PILOT_WORKERS", "1"))
+          lock = threading.Lock()
           days = [D0 + datetime.timedelta(days=i) for i in range((D1 - D0).days + 1)]
           res = {}                                                     # (day, side) -> array | None(nodata)
+          nodata_why = collections.defaultdict(list)                   # (day, side) -> reasons seen
+          okcount = [0]
+
+
+          def one(item, tag=""):
+              """one request with a live log line; returns True if the item is settled (ok or nodata), False if it failed"""
+              global stopped
+              d, s = item
+              if time.time() > DEADLINE: return None
+              if stopped: return None
+              t1 = time.time(); st, x = fetch(d, s)
+              with lock:
+                  stats["requests"] += 1
+                  print(f"{tag}{d} {s} -> {st}" + (f" ({x})" if st in ("fail", "nodata") else "") + f" | {time.time() - t1:.1f} s | http so far {dict(stats['http'])} | total {time.time() - stats['t0']:.0f} s", flush=True)
+                  if st == "ok": res[item] = x; okcount[0] += 1; ret = True
+                  elif st == "nodata": res[item] = None; nodata_why[item].append(x); ret = True
+                  else: ret = False
+                  if stats["requests"] >= 12 and okcount[0] == 0 and not stopped: stopped = "no request succeeded in the first 12 - the old host does not answer; stopping early"
+              time.sleep(PACE)
+              return ret
+
+
+          def run(items, tag=""):
+              with ThreadPoolExecutor(max_workers=WORKERS) as ex: out = list(ex.map(lambda it: one(it, tag), items))
+              return [it for it, r in zip(items, out) if r is False]
+
+
           todo = [(d, s) for d in days for s in ("BID", "ASK")]
           for rnd in range(3):
-              left = []
-              for d, s in todo:
-                  if time.time() > DEADLINE: stopped = f"time budget of {MAXMIN:g} min used up"; break
-                  t1 = time.time(); st, x = fetch(d, s); stats["requests"] += 1
-                  print(f"{d} {s} -> {st}" + (f" ({x})" if st == 'fail' else "") + f" | {time.time() - t1:.1f} s | http so far {dict(stats['http'])} | total {time.time() - stats['t0']:.0f} s", flush=True)
-                  if stats["requests"] >= 12 and not any(v is not None for v in res.values()) and not stats["attempts"].get(1) and sum(1 for k in stats["attempts"] if k != "fail") == 0:
-                      stopped = "no request succeeded in the first 12 - the old host does not answer; stopping early"; break
-                  if st == "ok": res[(d, s)] = x
-                  elif st == "nodata": res[(d, s)] = None
-                  else: left.append((d, s))
-                  time.sleep(PACE)
-                  if blocked_run >= 12: break
-              print(f"round {rnd + 1}: {len(todo) - len(left)} of {len(todo)} done, {len(left)} failed, {time.time() - stats['t0']:.0f} s so far")
+              left = run(todo)
+              print(f"round {rnd + 1}: {len(todo) - len(left)} of {len(todo)} done, {len(left)} failed, {time.time() - stats['t0']:.0f} s so far", flush=True)
               todo = left
-              if not todo or blocked_run >= 12: break
-              if stopped: break
+              if not todo or blocked_run >= 12 or stopped or time.time() > DEADLINE: break
               time.sleep(60)
           failed = todo
+          # a weekday with only ONE side (or none) is suspicious: the host may answer 404 / empty when it is overloaded -> ask again, up to 2 more times
+          for rc in range(2):
+              sus = []
+              for d in days:
+                  if (d, "BID") not in res or (d, "ASK") not in res: continue
+                  b, a = res[(d, "BID")], res[(d, "ASK")]
+                  if (b is None) != (a is None): sus.append((d, "BID" if b is None else "ASK"))
+                  elif b is None and a is None and d.weekday() < 5: sus += [(d, "BID"), (d, "ASK")]
+              if not sus or stopped or time.time() > DEADLINE: break
+              print(f"recheck {rc + 1}: {len(sus)} requests for weekdays with a missing side", flush=True)
+              run(sus, "recheck ")
           if blocked_run >= 12: stopped = "12 refusals (403/429) in a row - looks like a block"
+          if time.time() > DEADLINE and not stopped: stopped = f"time budget of {MAXMIN:g} min used up"
           if stopped: print("STOPPED:", stopped, flush=True)
 
           rows = []; one_side = []; mism = 0; daycount = {}
@@ -179,7 +214,8 @@ jobs:
           ts = np.array([r[0] for r in rows]); sp = np.array([float(r[8]) - float(r[4]) for r in rows])
           hi_ok = np.mean([float(r[2]) >= max(float(r[1]), float(r[4])) and float(r[3]) <= min(float(r[1]), float(r[4])) for r in rows])
           el = time.time() - stats["t0"]
-          rep += [f"days asked {len(days)} | days with both sides {len(daycount)} | one side only {len(one_side)} {one_side[:5]} | requests failed for good {len(failed)} {[str(d)+s for d, s in failed[:8]]}",
+          rep += [f"days asked {len(days)} | days with both sides {len(daycount)} | one side only {len(one_side)} {one_side} | requests failed for good {len(failed)} {[str(d)+s for d, s in failed[:8]]}",
+                  "reasons for missing sides (day side: answers seen): " + "; ".join(f"{d} {s}: {','.join(v)}" for (d, s), v in sorted(nodata_why.items()) if d.weekday() < 5) [:900],
                   f"candles {len(rows):,} | time strictly increasing {bool(np.all(np.diff(ts) > 0))} | Bid-only/Ask-only timestamps (not merged) {mism}",
                   f"candles per day: min {min(daycount.values())} median {int(statistics.median(daycount.values()))} max {max(daycount.values())} | days under 1440: {sum(1 for v in daycount.values() if v < 1440)}",
                   f"first {datetime.datetime.fromtimestamp(rows[0][0], datetime.timezone.utc):%Y-%m-%d %H:%M} last {datetime.datetime.fromtimestamp(rows[-1][0], datetime.timezone.utc):%Y-%m-%d %H:%M} UTC",
@@ -187,7 +223,7 @@ jobs:
                   f"first candle: {rows[0]}", f"last candle: {rows[-1]}",
                   f"PACK: csv {len(data):,} B -> .cpk {len(blob):,} B ({100 - 100 * len(blob) / len(data):.0f} % smaller) | decode identical (64 bit) {ok_pack} | every text cell equals decoded number {ok_cells}",
                   f"NETWORK: requests {stats['requests']} (incl. retry rounds) | http answers {dict(stats['http'])} | attempts per request (1 = first try) {dict(sorted(stats['attempts'].items(), key=lambda x: str(x[0])))}",
-                  f"time {el:.0f} s = {el / max(1, stats['requests']):.1f} s per request | volumes rounded to 2 decimals (like the library output)"]
+                  f"time {el:.0f} s = {el / max(1, stats['requests']):.1f} s per request | workers {WORKERS} | {60 * stats['requests'] / max(1, el):.2f} requests per minute | volumes rounded to 2 decimals (like the library output)"]
           open(f"{OUT}/pilot_report.txt", "w").write("\n".join(rep) + "\n"); print("\n".join(rep))
           if not (ok_pack and ok_cells): raise SystemExit(2)
           PYEOF
