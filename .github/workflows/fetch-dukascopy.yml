@@ -1,0 +1,561 @@
+name: fetch-dukascopy
+
+# Dukascopy 1-minute (Bid + Ask + volume) -> one SYMBOL-1m.cpk per instrument in releases dukascopy-1m-<category>.
+#  - By hand: Actions -> fetch-dukascopy -> Run workflow (everything is pre-set, just press the green button).
+#  - Weekly (automatic, Monday 03:23 UTC): all categories, only the new days are added (about 14 requests per instrument).
+#  - It starts itself again (chain) until everything is finished or chain_left runs out. Slow + complete on purpose.
+#  - The NEW host is always tried first (newprobe.js, and again before every 30-day block); it is used only when its candles
+#    are IDENTICAL to the old host for sample days. Otherwise the old host (datafeed.dukascopy.com) is used, slowly, with retries.
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "metals | forex | indices | energy | agri | bonds | crypto | etf | stocks | mutual-funds | other | all (all = priority order)"
+        default: "metals"
+      shards:
+        description: "parallel jobs (6 = careful start, max 20)"
+        default: "6"
+      workers:
+        description: "parallel requests inside one job"
+        default: "3"
+      budget_hours:
+        description: "hours of work per job (max about 5.5)"
+        default: "5.3"
+      chain_left:
+        description: "how many times it may start itself again"
+        default: "60"
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: dukascopy-fetch
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  CATEGORY: ${{ inputs.category || 'all' }}
+  SHARDS: ${{ inputs.shards || '6' }}
+  WORKERS: ${{ inputs.workers || '3' }}
+  BUDGET_HOURS: ${{ inputs.budget_hours || '5.3' }}
+  CHAIN_LEFT: ${{ inputs.chain_left || '60' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      count: ${{ steps.p.outputs.count }}
+      matrix: ${{ steps.p.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - name: Write scripts
+        run: |
+          mkdir -p run
+          cp "$(find . -name candle_pack.py -not -path './run/*' | head -1)" run/candle_pack.py
+          cat > run/dd.py <<'PYEOF_DD'
+          #!/usr/bin/env python3
+          # Dukascopy 1-minute downloader (Bid + Ask + volume) -> one growing SYMBOL-1m.cpk per instrument in GitHub releases.
+          #   dd.py plan      decide what is still to do, create releases, write todo.json
+          #   dd.py shard     download for this shard's instruments (old host; new host only when it is open AND verified), upload .cpk
+          #   dd.py finalize  merge INDEX.csv / GAPS.csv per release, print the summary, say whether to start another run
+          import os, sys, io, csv, json, time, lzma, subprocess, datetime, collections, threading, urllib.request, urllib.error, shutil
+          from concurrent.futures import ThreadPoolExecutor
+          import numpy as np
+          sys.path.insert(0, os.environ.get("CPDIR", "."))
+          import candle_pack as cp
+
+          ENV = os.environ.get
+          PRIORITY = ["metals", "forex", "indices", "energy", "agri", "bonds", "crypto", "etf", "stocks", "mutual-funds", "other"]
+          UTC = datetime.timezone.utc
+          NOW = lambda: datetime.datetime.now(UTC)
+          TODAY = lambda: NOW().date()
+          YESTERDAY = lambda: TODAY() - datetime.timedelta(days=1)
+          HEAD = ["time", "bid_open", "bid_high", "bid_low", "bid_close", "ask_open", "ask_high", "ask_low", "ask_close", "bid_volume", "ask_volume"]
+          IDX_COLS = ["symbol", "category", "release", "first_utc", "last_utc", "rows", "checked_through", "status", "source", "updated_utc", "first_bid_close", "last_bid_close",
+                      "nodata_weekdays", "size_bytes", "added_rows", "note"]
+          WORK = ENV("WORK_DIR", "work")
+
+
+          def gh(*a, retries=3):
+              r = None
+              for k in range(retries):
+                  r = subprocess.run(["gh", *a], capture_output=True, text=True)
+                  if r.returncode == 0: return r
+                  time.sleep(3 * (k + 1))
+              return r
+
+
+          def summary(txt):
+              p = ENV("GITHUB_STEP_SUMMARY")
+              if p: open(p, "a").write(txt + "\n")
+
+
+          def rd_csv(path):
+              return list(csv.DictReader(open(path, encoding="utf-8"))) if os.path.exists(path) else []
+
+
+          def get_asset(tag, name, dest):
+              """download one release asset to dest dir; returns path or None"""
+              os.makedirs(dest, exist_ok=True)
+              r = gh("release", "download", tag, "-p", name, "-D", dest, "--clobber", retries=2)
+              p = os.path.join(dest, name)
+              return p if r.returncode == 0 and os.path.exists(p) else None
+
+
+          # ----------------------------------------------------------------------------------------------------------------------------- plan
+          def plan():
+              cat = ENV("CATEGORY", "metals").strip().lower(); nsh = int(ENV("SHARDS", "6"))
+              plan_rows = rd_csv("dukascopy_plan.csv"); real = {r["id"]: r for r in rd_csv("dukascopy_real_start.csv")}
+              scale = {r["id"]: r["decimalFactor"] for r in rd_csv("dukascopy_scale.csv") if r["decimalFactor"]}
+              cats = PRIORITY if cat == "all" else [cat]
+              if cat != "all" and cat not in PRIORITY: raise SystemExit("unknown category " + cat)
+              sel = sorted([r for r in plan_rows if r["category"] in cats], key=lambda r: (PRIORITY.index(r["category"]), r["id"]))
+              print("selected instruments:", len(sel), "categories:", cats)
+              tags = sorted(set(r["release_tag"] for r in sel)); index = {}
+              for t in tags:
+                  if gh("release", "view", t, retries=1).returncode != 0:
+                      gh("release", "create", t, "--title", t, "--notes", "Dukascopy 1-minute candles (Bid+Ask+volume), one SYMBOL-1m.cpk per instrument, INDEX.csv = status")
+                  p = get_asset(t, "INDEX.csv", os.path.join(WORK, "idx_" + t))
+                  for r in rd_csv(p) if p else []: index[r["symbol"]] = r
+              y = YESTERDAY(); todo = []; skipped = collections.Counter()
+              for r in sel:
+                  i = r["id"]; rs = real.get(i, {}); verdict = rs.get("verdict", "")
+                  start = rs.get("real_first_day", "") if verdict in ("OK_CONFIRMED", "M1_FOUND") and rs.get("best_timeframe", "m1") == "m1" else ""
+                  row = index.get(i)
+                  if row and row.get("status") in ("COMPLETE", "NO_DATA") and row.get("checked_through", "") >= str(y): continue
+                  item = {"id": i, "category": r["category"], "tag": r["release_tag"], "name": r["name"], "start": start, "df": scale.get(i, ""),
+                          "checked_through": (row or {}).get("checked_through", ""), "days": int(r["days"]) if r["days"] else 0}
+                  if not start: item["problem"] = "START_UNKNOWN"
+                  elif not item["df"]: item["problem"] = "NO_SCALE"
+                  todo.append(item)
+              work = [t for t in todo if "problem" not in t]; probs = [t for t in todo if "problem" in t]
+              k = max(1, min(nsh, len(work))); loads = [0] * k; shards = [[] for _ in range(k)]
+              for c in cats:                                                         # balance by size, category after category (priority kept)
+                  for t in sorted([t for t in work if t["category"] == c], key=lambda t: -t["days"]):
+                      j = loads.index(min(loads)); shards[j].append(t); loads[j] += t["days"]
+              for j in range(k): shards[j].sort(key=lambda t: (PRIORITY.index(t["category"]), t["id"]))
+              for j, p in enumerate(probs): shards[j % k].append(p)                    # problems only produce an INDEX line, no requests
+              os.makedirs("plan_out", exist_ok=True)
+              json.dump({"shards": shards, "yesterday": str(y), "category": cat}, open("plan_out/todo.json", "w"))
+              cnt = collections.Counter(t["category"] for t in work)
+              lines = [f"### Plan ({NOW():%Y-%m-%d %H:%M} UTC)", f"category input: {cat} | instruments with work: {len(work)} | problems (no request possible): {len(probs)} | shards used: {k}",
+                       "per category: " + ", ".join(f"{c} {cnt[c]}" for c in cats if cnt[c]), f"estimated requests (every day x 2 sides, upper bound): {sum(t['days'] * 2 for t in work):,}"]
+              if probs: lines.append("problems: " + ", ".join(f"{t['id']}:{t['problem']}" for t in probs[:30]))
+              print("\n".join(lines)); summary("\n".join(lines))
+              out = ENV("GITHUB_OUTPUT")
+              if out: open(out, "a").write(f"count={len(work) + len(probs)}\nmatrix={json.dumps({'shard': list(range(k))})}\n")
+
+
+          # ----------------------------------------------------------------------------------------------------------------------------- hosts
+          DT = np.dtype([("t", ">u4"), ("o", ">u4"), ("c", ">u4"), ("l", ">u4"), ("h", ">u4"), ("v", ">f4")])
+          TRIES = int(ENV("TRIES", "4")); BACKOFF = float(ENV("BACKOFF", "2")); TMO = float(ENV("TIMEOUT", "20")); PACE = float(ENV("PACE", "1.5"))
+          WORKERS = int(ENV("WORKERS", "3"))
+          DEADLINE = time.time() + float(ENV("BUDGET_HOURS", "5.3")) * 3600
+          S = {"req": 0, "ok": 0, "http": collections.Counter(), "blocked": 0, "stop": "", "new_rows": 0, "t0": time.time()}
+          lock = threading.Lock()
+
+
+          def old_fetch(inst, day, side):
+              """('ok', array) | ('nodata', '404'|'empty 200') | ('fail', reason)   (month in the URL is 0-based)"""
+              url = f"https://datafeed.dukascopy.com/datafeed/{inst.upper()}/{day.year}/{day.month - 1:02d}/{day.day:02d}/{side}_candles_min_1.bi5"
+              reason = ""
+              for k in range(TRIES):
+                  try:
+                      b = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=TMO).read()
+                      S["http"][200] += 1
+                      if not b: return "nodata", "empty 200"
+                      raw = lzma.decompress(b)
+                      if len(raw) % 24: raise ValueError("size not multiple of 24")
+                      S["blocked"] = 0
+                      return "ok", np.frombuffer(raw, dtype=DT)
+                  except urllib.error.HTTPError as e:
+                      S["http"][e.code] += 1; reason = f"HTTP {e.code}"
+                      if e.code == 404: S["blocked"] = 0; return "nodata", "404"
+                      if e.code in (403, 429): S["blocked"] += 1
+                  except Exception as e:
+                      reason = type(e).__name__ + ":" + str(e)[:40]; S["http"]["err"] += 1
+                  time.sleep(BACKOFF * (k + 1))
+                  if S["blocked"] >= 12: break
+              return "fail", reason
+
+
+          def fmt_old(arr, df, dec):
+              """array of one day -> {minute_of_day: (o,h,l,c,volume) as text}"""
+              f = lambda q: f"{int(q) / df:.{dec}f}"
+              return {int(r["t"]) // 60: (f(r["o"]), f(r["h"]), f(r["l"]), f(r["c"]), f"{round(float(r['v']), 2):.2f}") for r in arr}
+
+
+          def old_days(inst, days, df, dec):
+              """-> res {(day, side): {minute: tuple} | None(nodata)} with only RESOLVED requests, why {(day, side): [reasons]}"""
+              res, why = {}, collections.defaultdict(list)
+
+              def one(item):
+                  d, s = item
+                  if time.time() > DEADLINE or S["stop"]: return None
+                  st, x = old_fetch(inst, d, s)
+                  with lock:
+                      S["req"] += 1
+                      if st == "ok": res[item] = fmt_old(x, df, dec); S["ok"] += 1
+                      elif st == "nodata": res[item] = None; why[item].append(x)
+                      if S["req"] % 25 == 0:
+                          print(f"  [{inst}] req {S['req']} ok {S['ok']} http {dict(S['http'])} | {time.time() - S['t0']:.0f} s", flush=True)
+                      if S["blocked"] >= 12: S["stop"] = "BLOCKED? 12 refusals (403/429) in a row"
+                  time.sleep(PACE)
+                  return st != "fail"
+
+              def run(items):
+                  with ThreadPoolExecutor(max_workers=WORKERS) as ex: out = list(ex.map(one, items))
+                  return [it for it, r in zip(items, out) if r is False]
+
+              todo = [(d, s) for d in days for s in ("BID", "ASK")]
+              for rnd in range(3):
+                  left = run(todo)
+                  if not left or S["stop"] or time.time() > DEADLINE: break
+                  todo = left; time.sleep(60)
+              for rc in range(2):                                                    # a weekday with a missing side is suspicious -> ask again
+                  sus = []
+                  for d in days:
+                      if (d, "BID") not in res or (d, "ASK") not in res: continue
+                      b, a = res[(d, "BID")], res[(d, "ASK")]
+                      if (b is None) != (a is None): sus.append((d, "BID" if b is None else "ASK"))
+                      elif b is None and a is None and d.weekday() < 5: sus += [(d, "BID"), (d, "ASK")]
+                  if not sus or S["stop"] or time.time() > DEADLINE: break
+                  run(sus)
+              return res, why
+
+
+          NEW = {"checked": 0, "open": False}
+
+
+          def new_host_open():
+              if time.time() - NEW["checked"] < 600: return NEW["open"]
+              try:
+                  r = subprocess.run(["node", "newprobe.js"], capture_output=True, text=True, timeout=180); NEW["open"] = "NEW HOST: OPEN" in r.stdout
+              except Exception: NEW["open"] = False
+              NEW["checked"] = time.time()
+              print("NEW HOST:", "OPEN" if NEW["open"] else "blocked", flush=True)
+              return NEW["open"]
+
+
+          def new_days(inst, days, dec):
+              """library (new host) for the day range -> {(day, side): {minute: tuple}} ; raises on any problem"""
+              out = os.path.join(WORK, f"new_{inst}.json")
+              r = subprocess.run(["node", "fetch_new.js", inst, str(days[0]), str(days[-1] + datetime.timedelta(days=1)), out], capture_output=True, text=True, timeout=3600)
+              if r.returncode != 0: raise RuntimeError("new host fetch failed: " + (r.stdout + r.stderr)[-200:])
+              js = json.load(open(out)); res = {}
+              for side, key in (("BID", "bid"), ("ASK", "ask")):
+                  for c in js[key]:
+                      ts = int(c["timestamp"]) // 1000; d = datetime.datetime.fromtimestamp(ts, UTC).date(); m = (ts % 86400) // 60
+                      res.setdefault((d, side), {})[m] = tuple(f"{float(c[k]):.{dec}f}" for k in ("open", "high", "low", "close")) + (f"{round(float(c.get('volume') or 0), 2):.2f}",)
+              for d in days:
+                  for s in ("BID", "ASK"): res.setdefault((d, s), None)                 # the library returns nothing for days without data
+              return res
+
+
+          def verify_new(inst, df, dec, sample_days):
+              """new host must give EXACTLY the old host's candles for sample days, otherwise it is not used"""
+              try:
+                  nw = new_days(inst, sorted(sample_days), dec)
+              except Exception as e:
+                  return False, str(e)[:120]
+              old, _ = old_days(inst, sorted(sample_days), df, dec)
+              bad = []
+              for k in [(d, sd) for d in sample_days for sd in ("BID", "ASK")]:
+                  if k not in old: return False, "old host could not be read for the comparison"
+                  a, b = old[k], nw[k]
+                  if (a is None) != (b is None) or (a is not None and a != b):
+                      bad.append(f"{k[0]} {k[1]}: old {0 if a is None else len(a)} minutes / new {0 if b is None else len(b)} minutes" + ("" if a is None or b is None else f", values differ in {sum(1 for m in a if m in b and a[m] != b[m])}"))
+              return (not bad), "; ".join(bad[:3])
+
+
+          # ----------------------------------------------------------------------------------------------------------------------------- storage
+          FROM_NEW = [False]
+
+
+          def load_cpk(tag, name_base):
+              """newest readable pack of the instrument: SYMBOL-1m.cpk.new (just uploaded) first, then SYMBOL-1m.cpk; -> (names, cols, unit) | None"""
+              FROM_NEW[0] = False
+              for nm in (name_base + ".new", name_base):
+                  p = get_asset(tag, nm, os.path.join(WORK, "dl"))
+                  if not p: continue
+                  try:
+                      names, cols, unit = cp.decode(open(p, "rb").read()); os.remove(p); FROM_NEW[0] = nm.endswith(".new"); return names, cols, unit
+                  except BaseException as e:
+                      print(f"  {nm}: unreadable ({str(e)[:60]}), trying the other copy", flush=True)
+              return None
+
+
+          def safe_upload(tag, name_base, blob):
+              """.new first (complete copy), then the real name, then remove .new -> a stop in between never loses the data"""
+              d = os.path.join(WORK, "up"); os.makedirs(d, exist_ok=True)
+              for nm in (name_base + ".new", name_base):
+                  p = os.path.join(d, nm); open(p, "wb").write(blob)
+                  if gh("release", "upload", tag, p, "--clobber").returncode != 0: raise RuntimeError("upload failed " + nm)
+                  os.remove(p)
+              gh("release", "delete-asset", tag, name_base + ".new", "-y", retries=2)
+
+
+          def mk_rows(day, bm, am):
+              ep = int(datetime.datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp()); out = []
+              for m in sorted(set(bm) & set(am)):
+                  b, a = bm[m], am[m]; out.append([ep + m * 60, *b[:4], *a[:4], b[4], a[4]])
+              return out
+
+
+          def pack_merge(existing, rows):
+              """existing (names, cols, unit) | None  +  new csv rows -> blob, merged arrays; verified 64-bit identical + every new text cell"""
+              buf = io.StringIO(); w = csv.writer(buf, lineterminator="\n"); w.writerow(HEAD); w.writerows(rows); data = buf.getvalue().encode()
+              n1, c1, u1 = cp.read_one("new", data)
+              parts = ([existing] if existing else []) + [(n1, c1, u1)]
+              names, cols, unit = cp.concat(parts) if len(parts) > 1 else (n1, c1, u1)
+              blob = cp.encode(names, cols, unit); n2, c2, u2 = cp.decode(blob)
+              if not (n2 == names and u2 == unit and cp.same(cols, c2, names)): raise RuntimeError("pack verification failed (64 bit)")
+              txt = [r for r in csv.reader(io.StringIO(data.decode()))][1:]; ts_new = c1[names[0]]
+              pos = np.searchsorted(c2[names[0]], ts_new)
+              for i, nm in enumerate(names):
+                  if not np.array_equal(np.array([float(r[i]) for r in txt]), c2[nm][pos]): raise RuntimeError("pack verification failed (text cells)")
+              return blob, (names, cols, unit)
+
+
+          def shard():
+              sh_i = int(ENV("SHARD", "0")); todo = json.load(open("todo.json")); y = datetime.date.fromisoformat(todo["yesterday"]); mine = todo["shards"][sh_i]
+              os.makedirs(WORK, exist_ok=True); parts, gaps, notes = [], [], []
+              print(f"shard {sh_i}: {len(mine)} instruments, budget {ENV('BUDGET_HOURS', '5.3')} h, workers {WORKERS}", flush=True)
+              for inst in mine:
+                  i = inst["id"]; row = {"symbol": i, "category": inst["category"], "release": inst["tag"], "updated_utc": f"{NOW():%Y-%m-%d %H:%M}", "added_rows": 0, "source": ""}
+                  if "problem" in inst:
+                      row.update(status=inst["problem"], note="no request possible" if inst["problem"] == "NO_SCALE" else "real first day unknown (start check had an error)"); parts.append(row); continue
+                  if time.time() > DEADLINE or S["stop"]: break
+                  df = int(float(inst["df"])); dec = len(str(df)) - 1; base = f"{i.upper()}-1m.cpk"
+                  try:
+                      ex = load_cpk(inst["tag"], base)
+                  except Exception as e:
+                      ex = None; notes.append(f"{i}: load error {e}")
+                  heal = bool(ex) and FROM_NEW[0]
+                  failed = False
+                  last_day = datetime.datetime.fromtimestamp(int(ex[1][ex[0][0]][-1]), UTC).date() if ex else None
+                  ct = datetime.date.fromisoformat(inst["checked_through"]) if inst.get("checked_through") else None
+                  nxt = max([d for d in (last_day, ct) if d] or [None]) if (last_day or ct) else None
+                  nxt = nxt + datetime.timedelta(days=1) if nxt else datetime.date.fromisoformat(inst["start"])
+                  pend, srcs, nodata_wd, checked = [], set(), 0, (nxt - datetime.timedelta(days=1))
+                  use_new = None; flushed = time.time(); total_added = 0; safe_checked = checked
+                  print(f"== {i} ({inst['category']}): {nxt} .. {y}  existing rows {len(ex[1][ex[0][0]]) if ex else 0}", flush=True)
+
+                  def flush(final=False):
+                      nonlocal ex, pend, flushed, total_added, heal, safe_checked
+                      if not pend and not (final and heal): return
+                      if pend: blob, merged = pack_merge(ex, pend)
+                      else: merged = ex; blob = cp.encode(*ex)                       # heal: a previous run left only the .new copy
+                      safe_upload(inst["tag"], base, blob)
+                      ex = merged; total_added += len(pend); pend = []; flushed = time.time(); heal = False; safe_checked = checked
+                      print(f"  uploaded {base}: {len(merged[1][merged[0][0]]):,} rows, {len(blob) / 1e6:.2f} MB", flush=True)
+
+                  while nxt <= y and time.time() < DEADLINE and not S["stop"]:
+                      chunk = [nxt + datetime.timedelta(days=k) for k in range(30) if nxt + datetime.timedelta(days=k) <= y]
+                      res = None
+                      if new_host_open():
+                          if use_new is None:
+                              sample = {chunk[0], chunk[len(chunk) // 2]} | set([d for d in chunk if d.weekday() == 5][:1]) | set([d for d in chunk if d.weekday() == 6][:1])
+                              use_new, why = verify_new(i, df, dec, sample)
+                              notes.append(f"{i}: new host open - verification {'PASSED' if use_new else 'FAILED: ' + why}"); print(notes[-1], flush=True)
+                          if use_new:
+                              try: res = new_days(i, chunk, dec); srcs.add("new")
+                              except Exception as e: notes.append(f"{i}: new host failed: {str(e)[:80]}"); use_new = False; res = None
+                      if res is None:
+                          res, _ = old_days(i, chunk, df, dec); srcs.add("old")
+                      good = []
+                      for d in chunk:                                               # longest prefix of fully resolved days
+                          if (d, "BID") in res and (d, "ASK") in res: good.append(d)
+                          else: break
+                      if not good: break
+                      for d in good:
+                          b, a = res[(d, "BID")], res[(d, "ASK")]
+                          if b is not None and a is not None: pend += mk_rows(d, b, a)
+                          elif d.weekday() < 5 or (b is not None) != (a is not None):
+                              nodata_wd += d.weekday() < 5
+                              gaps.append({"symbol": i, "day": str(d), "what": "NO_DATA_BOTH_SIDES" if b is None and a is None else ("ONLY_BID" if a is None else "ONLY_ASK")})
+                      checked = good[-1]; nxt = checked + datetime.timedelta(days=1)
+                      if time.time() - flushed > 45 * 60:
+                          try: flush()
+                          except Exception as e: failed = True; notes.append(f"{i}: upload/pack failed: {str(e)[:100]}"); break
+                  if not failed:
+                      try: flush(final=True)
+                      except Exception as e: failed = True; notes.append(f"{i}: upload/pack failed: {str(e)[:100]}")
+                  if failed: checked = safe_checked; nxt = checked + datetime.timedelta(days=1); gaps[:] = [g for g in gaps if g["symbol"] != i or g["day"] <= str(checked)]; row["note"] = "upload failed - will retry next run"
+                  st = "COMPLETE" if nxt > y else "PARTIAL"
+                  if ex is None and st == "COMPLETE": st = "NO_DATA"
+                  if ex:
+                      ts = ex[1][ex[0][0]]; bc = ex[1]["bid_close"]; row.update(first_utc=f"{datetime.datetime.fromtimestamp(int(ts[0]), UTC):%Y-%m-%d %H:%M}", last_utc=f"{datetime.datetime.fromtimestamp(int(ts[-1]), UTC):%Y-%m-%d %H:%M}",
+                                                                        rows=len(ts), first_bid_close=f"{bc[0]:.{dec}f}", last_bid_close=f"{bc[-1]:.{dec}f}")
+                  row.update(checked_through=str(checked) if (checked and (ex is not None or st != "PARTIAL" or total_added)) else inst.get("checked_through", ""), status=st,
+                             source="+".join(sorted(srcs)) if srcs else "", nodata_weekdays=nodata_wd, added_rows=total_added)
+                  parts.append(row); print(f"== {i}: {st}, added {total_added:,} rows, checked through {checked}", flush=True)
+              os.makedirs("part_out", exist_ok=True)
+              for name, rows, cols in (("index_part", parts, IDX_COLS), ("gaps_part", gaps, ["symbol", "day", "what"])):
+                  with open(f"part_out/{name}_{sh_i}.csv", "w", newline="", encoding="utf-8") as f:
+                      w = csv.DictWriter(f, fieldnames=cols, restval=""); w.writeheader(); w.writerows(rows)
+              el = time.time() - S["t0"]
+              log = [f"shard {sh_i}: instruments seen {len(parts)} of {len(mine)} | requests {S['req']} ok {S['ok']} | http {dict(S['http'])} | {el:.0f} s | {60 * S['req'] / max(1, el):.2f} req/min",
+                     f"stop reason: {S['stop'] or ('time budget' if time.time() > DEADLINE else 'list finished')}"] + notes
+              open(f"part_out/log_{sh_i}.txt", "w").write("\n".join(log) + "\n"); print("\n".join(log))
+
+
+          # ----------------------------------------------------------------------------------------------------------------------------- finalize
+          def finalize():
+              idx_new, gaps_new, logs = {}, [], []
+              for r in sorted(os.listdir("parts")) if os.path.isdir("parts") else []:
+                  p = os.path.join("parts", r)
+                  if r.startswith("index_part"): idx_new.update({x["symbol"]: x for x in rd_csv(p)})
+                  elif r.startswith("gaps_part"): gaps_new += rd_csv(p)
+                  elif r.startswith("log_"): logs.append(open(p).read().strip())
+              tags = sorted(set(x["release"] for x in idx_new.values())); added = 0; partial = 0; per = collections.defaultdict(collections.Counter)
+              for t in tags:
+                  cur = {}
+                  p = get_asset(t, "INDEX.csv", os.path.join(WORK, "fi_" + t))
+                  for x in rd_csv(p) if p else []: cur[x["symbol"]] = x
+                  for s, x in idx_new.items():
+                      if x["release"] != t: continue
+                      old = cur.get(s, {})
+                      if x.get("status") in ("START_UNKNOWN", "NO_SCALE") and old: x = {**old, "status": x["status"], "note": x.get("note", "")}
+                      else: x = {**{k: old.get(k, "") for k in IDX_COLS}, **{k: v for k, v in x.items() if v != ""}}
+                      cur[s] = x
+                      added += int(x.get("added_rows") or 0); per[x["category"]][x["status"]] += 1; partial += x["status"] == "PARTIAL" and int(x.get("added_rows") or 0) > 0
+                  os.makedirs("out", exist_ok=True)
+                  with open("out/INDEX.csv", "w", newline="", encoding="utf-8") as f:
+                      w = csv.DictWriter(f, fieldnames=IDX_COLS, restval="", extrasaction="ignore"); w.writeheader(); [w.writerow(cur[k]) for k in sorted(cur)]
+                  gp = get_asset(t, "GAPS.csv", os.path.join(WORK, "fg_" + t)); g = {(x["symbol"], x["day"], x["what"]): x for x in rd_csv(gp) if gp} if gp else {}
+                  for x in gaps_new:
+                      if x["symbol"] in idx_new and idx_new[x["symbol"]]["release"] == t: g[(x["symbol"], x["day"], x["what"])] = x
+                  with open("out/GAPS.csv", "w", newline="", encoding="utf-8") as f:
+                      w = csv.DictWriter(f, fieldnames=["symbol", "day", "what"]); w.writeheader(); [w.writerow(g[k]) for k in sorted(g)]
+                  gh("release", "upload", t, "out/INDEX.csv", "out/GAPS.csv", "--clobber")
+              stopped = any("BLOCKED?" in l for l in logs)
+              lines = ["### Result of this run", f"rows added: {added:,} | instruments still PARTIAL after progress: {partial}"] + [f"{c}: {dict(v)}" for c, v in per.items()] + ["", *logs]
+              if stopped: lines.append("A shard saw 12 refusals in a row (403/429): NO new run will be started automatically. Look at the log before running again.")
+              print("\n".join(lines)); summary("\n".join(["```"] + lines + ["```"]))
+              again = (partial > 0 and not stopped and int(ENV("CHAIN_LEFT", "0")) > 0)
+              open(ENV("GITHUB_OUTPUT", "/dev/null"), "a").write(f"again={'true' if again else 'false'}\n")
+
+
+          if __name__ == "__main__":
+              {"plan": plan, "shard": shard, "finalize": finalize}[sys.argv[1]]()
+          PYEOF_DD
+          cat > run/newprobe.js <<'JSEOF_A'
+          const { getHistoricalRates } = require('dukascopy-node');
+          getHistoricalRates({ instrument: 'eurusd', dates: { from: '2025-03-04', to: '2025-03-05' }, timeframe: 'm1', priceType: 'bid', format: 'json', volumes: true, retryCount: 1, failAfterRetryCount: true })
+            .then((d) => console.log(d.length > 0 ? 'NEW HOST: OPEN' : 'NEW HOST: empty'))
+            .catch((e) => console.log('NEW HOST: blocked -', ((e && e.name) || '') + ' ' + String((e && e.message) || e).slice(0, 80)));
+          JSEOF_A
+          cat > run/fetch_new.js <<'JSEOF_B'
+          // usage: node fetch_new.js <instrument> <from yyyy-mm-dd> <to yyyy-mm-dd (exclusive)> <out.json>   -> {"bid":[...],"ask":[...]} all minutes, flats included
+          const { getHistoricalRates } = require('dukascopy-node'); const fs = require('fs');
+          const [inst, from, to, out] = process.argv.slice(2);
+          (async () => {
+            const o = { bid: [], ask: [] };
+            for (const side of ['bid', 'ask']) {
+              o[side] = await getHistoricalRates({ instrument: inst, dates: { from, to }, timeframe: 'm1', priceType: side, format: 'json', volumes: true, ignoreFlats: false,
+                retryCount: 3, failAfterRetryCount: true, batchSize: 5, pauseBetweenBatchesMs: 500 });
+            }
+            fs.writeFileSync(out, JSON.stringify(o));
+          })().catch((e) => { console.error(String((e && e.message) || e)); process.exit(1); });
+          JSEOF_B
+      - name: Plan (what is still to do)
+        id: p
+        working-directory: run
+        env:
+          CPDIR: ${{ github.workspace }}/run
+        run: |
+          gh release download dukascopy-plan -R "$GITHUB_REPOSITORY" -p dukascopy_plan.csv -p dukascopy_real_start.csv -p dukascopy_scale.csv --clobber
+          python3 dd.py plan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: run-files
+          path: |
+            run/dd.py
+            run/newprobe.js
+            run/fetch_new.js
+            run/candle_pack.py
+            run/todo.json
+            run/plan_out/todo.json
+          if-no-files-found: warn
+
+  shard:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          name: run-files
+          path: run
+      - name: Install dukascopy-node (only for the new-host check)
+        working-directory: run
+        run: |
+          [ -f todo.json ] || cp plan_out/todo.json todo.json
+          npm install dukascopy-node || echo "npm install failed - the new host will simply count as closed"
+      - name: Download (shard ${{ matrix.shard }})
+        working-directory: run
+        env:
+          SHARD: ${{ matrix.shard }}
+          CPDIR: ${{ github.workspace }}/run
+          WORK_DIR: ${{ github.workspace }}/run/work
+        run: python3 -u dd.py shard
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-${{ matrix.shard }}
+          path: run/part_out
+          if-no-files-found: warn
+
+  finalize:
+    needs: [plan, shard]
+    if: always() && needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          name: run-files
+          path: run
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: run/parts
+          merge-multiple: true
+      - name: Merge INDEX.csv / GAPS.csv
+        id: f
+        working-directory: run
+        env:
+          CPDIR: ${{ github.workspace }}/run
+        run: python3 dd.py finalize
+      - name: Start the next round (chain)
+        if: steps.f.outputs.again == 'true'
+        run: |
+          left=$(( ${CHAIN_LEFT} - 1 ))
+          gh workflow run fetch-dukascopy.yml -R "$GITHUB_REPOSITORY" -f category="${CATEGORY}" -f shards="${SHARDS}" -f workers="${WORKERS}" -f budget_hours="${BUDGET_HOURS}" -f chain_left="$left"
+          echo "Next round started (chain_left=$left)" >> "$GITHUB_STEP_SUMMARY"
