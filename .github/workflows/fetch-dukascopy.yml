@@ -24,6 +24,9 @@ on:
       chain_left:
         description: "how many times it may start itself again"
         default: "60"
+      reset:
+        description: "ONLY to redo instruments whose data was wrong: ids separated by comma, e.g. xaggbp,xaghkd,xaghuf (their stored pack is deleted, they start again). Normally empty."
+        default: ""
   schedule:
     - cron: "23 3 * * 1"
 
@@ -42,6 +45,7 @@ env:
   WORKERS: ${{ inputs.workers || '3' }}
   BUDGET_HOURS: ${{ inputs.budget_hours || '5.3' }}
   CHAIN_LEFT: ${{ inputs.chain_left || '60' }}
+  RESET: ${{ inputs.reset || '' }}
 
 jobs:
   plan:
@@ -126,11 +130,17 @@ jobs:
                   p = get_asset(t, "INDEX.csv", os.path.join(WORK, "idx_" + t))
                   for r in rd_csv(p) if p else []: index[r["symbol"]] = r
               y = YESTERDAY(); todo = []; skipped = collections.Counter()
+              reset = {x.strip().lower() for x in ENV("RESET", "").split(",") if x.strip()}
+              for r in sel:                                                        # RESET = start these instruments again from scratch (wrong data found)
+                  if r["id"] in reset:
+                      index.pop(r["id"], None)
+                      for suf in ("", ".new"): gh("release", "delete-asset", r["release_tag"], f"{r['id'].upper()}-1m.cpk{suf}", "-y", retries=2)
+                      print("RESET:", r["id"], "- stored pack deleted, starts again from the real first day", flush=True)
               for r in sel:
                   i = r["id"]; rs = real.get(i, {}); verdict = rs.get("verdict", "")
                   start = rs.get("real_first_day", "") if verdict in ("OK_CONFIRMED", "M1_FOUND") and rs.get("best_timeframe", "m1") == "m1" else ""
                   row = index.get(i)
-                  if row and row.get("status") in ("COMPLETE", "NO_DATA") and row.get("checked_through", "") >= str(y): continue
+                  if row and (row.get("status") == "SUSPECT_SCALE" or (row.get("status") in ("COMPLETE", "NO_DATA") and row.get("checked_through", "") >= str(y))): continue
                   item = {"id": i, "category": r["category"], "tag": r["release_tag"], "name": r["name"], "start": start, "df": scale.get(i, ""),
                           "checked_through": (row or {}).get("checked_through", ""), "days": int(r["days"]) if r["days"] else 0}
                   if not start: item["problem"] = "START_UNKNOWN"
@@ -340,7 +350,7 @@ jobs:
                   except Exception as e:
                       ex = None; notes.append(f"{i}: load error {e}")
                   heal = bool(ex) and FROM_NEW[0]
-                  failed = False
+                  failed = False; suspect = False
                   last_day = datetime.datetime.fromtimestamp(int(ex[1][ex[0][0]][-1]), UTC).date() if ex else None
                   ct = datetime.date.fromisoformat(inst["checked_through"]) if inst.get("checked_through") else None
                   nxt = max([d for d in (last_day, ct) if d] or [None]) if (last_day or ct) else None
@@ -376,12 +386,19 @@ jobs:
                           if (d, "BID") in res and (d, "ASK") in res: good.append(d)
                           else: break
                       if not good: break
+                      n0, g0 = len(pend), len(gaps)
                       for d in good:
                           b, a = res[(d, "BID")], res[(d, "ASK")]
                           if b is not None and a is not None: pend += mk_rows(d, b, a)
                           elif d.weekday() < 5 or (b is not None) != (a is not None):
                               nodata_wd += d.weekday() < 5
                               gaps.append({"symbol": i, "day": str(d), "what": "NO_DATA_BOTH_SIDES" if b is None and a is None else ("ONLY_BID" if a is None else "ONLY_ASK")})
+                      ref = float(pend[n0 - 1][4]) if n0 else (float(ex[1]["bid_close"][-1]) if ex else None)       # last known price
+                      if len(pend) > n0 and ref:
+                          med = float(np.median([float(r[4]) for r in pend[n0:]]))
+                          if not (0.25 <= med / ref <= 4):                      # price jumps by more than 4x between blocks = wrong scale / bad data: do NOT store it
+                              del pend[n0:]; del gaps[g0:]; suspect = True
+                              notes.append(f"{i}: SUSPECT_SCALE at {good[0]}: price {ref} -> median {med}; block not stored"); print(notes[-1], flush=True); break
                       checked = good[-1]; nxt = checked + datetime.timedelta(days=1)
                       if time.time() - flushed > 45 * 60:
                           try: flush()
@@ -392,6 +409,7 @@ jobs:
                   if failed: checked = safe_checked; nxt = checked + datetime.timedelta(days=1); gaps[:] = [g for g in gaps if g["symbol"] != i or g["day"] <= str(checked)]; row["note"] = "upload failed - will retry next run"
                   st = "COMPLETE" if nxt > y else "PARTIAL"
                   if ex is None and st == "COMPLETE": st = "NO_DATA"
+                  if suspect: st = "SUSPECT_SCALE"; row["note"] = "price jumped >4x between blocks - check scale; not stored from there"
                   if ex:
                       ts = ex[1][ex[0][0]]; bc = ex[1]["bid_close"]; row.update(first_utc=f"{datetime.datetime.fromtimestamp(int(ts[0]), UTC):%Y-%m-%d %H:%M}", last_utc=f"{datetime.datetime.fromtimestamp(int(ts[-1]), UTC):%Y-%m-%d %H:%M}",
                                                                         rows=len(ts), first_bid_close=f"{bc[0]:.{dec}f}", last_bid_close=f"{bc[-1]:.{dec}f}")
@@ -410,6 +428,7 @@ jobs:
 
           # ----------------------------------------------------------------------------------------------------------------------------- finalize
           def finalize():
+              RESET = {x.strip().lower() for x in ENV("RESET", "").split(",") if x.strip()}
               idx_new, gaps_new, logs = {}, [], []
               for r in sorted(os.listdir("parts")) if os.path.isdir("parts") else []:
                   p = os.path.join("parts", r)
@@ -423,15 +442,16 @@ jobs:
                   for x in rd_csv(p) if p else []: cur[x["symbol"]] = x
                   for s, x in idx_new.items():
                       if x["release"] != t: continue
-                      old = cur.get(s, {})
+                      old = {} if s in RESET else cur.get(s, {})
                       if x.get("status") in ("START_UNKNOWN", "NO_SCALE") and old: x = {**old, "status": x["status"], "note": x.get("note", "")}
                       else: x = {**{k: old.get(k, "") for k in IDX_COLS}, **{k: v for k, v in x.items() if v != ""}}
                       cur[s] = x
-                      added += int(x.get("added_rows") or 0); per[x["category"]][x["status"]] += 1; partial += x["status"] == "PARTIAL" and int(x.get("added_rows") or 0) > 0
+                      added += int(x.get("added_rows") or 0); per[x["category"]][x["status"]] += 1; partial += x["status"] == "PARTIAL" and (int(x.get("added_rows") or 0) > 0 or x.get("checked_through", "") > old.get("checked_through", ""))
                   os.makedirs("out", exist_ok=True)
                   with open("out/INDEX.csv", "w", newline="", encoding="utf-8") as f:
                       w = csv.DictWriter(f, fieldnames=IDX_COLS, restval="", extrasaction="ignore"); w.writeheader(); [w.writerow(cur[k]) for k in sorted(cur)]
                   gp = get_asset(t, "GAPS.csv", os.path.join(WORK, "fg_" + t)); g = {(x["symbol"], x["day"], x["what"]): x for x in rd_csv(gp) if gp} if gp else {}
+                  for k in [k for k in g if k[0] in RESET and k[0] in idx_new]: del g[k]          # RESET: forget the old gap list of that instrument
                   for x in gaps_new:
                       if x["symbol"] in idx_new and idx_new[x["symbol"]]["release"] == t: g[(x["symbol"], x["day"], x["what"])] = x
                   with open("out/GAPS.csv", "w", newline="", encoding="utf-8") as f:
