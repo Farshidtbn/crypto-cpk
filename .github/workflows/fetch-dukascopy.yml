@@ -129,7 +129,12 @@ jobs:
                       gh("release", "create", t, "--title", t, "--notes", "Dukascopy 1-minute candles (Bid+Ask+volume), one SYMBOL-1m.cpk per instrument, INDEX.csv = status")
                   p = get_asset(t, "INDEX.csv", os.path.join(WORK, "idx_" + t))
                   for r in rd_csv(p) if p else []: index[r["symbol"]] = r
+              gapfile = {}
+              for t in tags:
+                  gp = get_asset(t, "GAPS.csv", os.path.join(WORK, "pg_" + t))
+                  for g in rd_csv(gp) if gp else []: gapfile.setdefault(g["symbol"], []).append(g)
               y = YESTERDAY(); todo = []; skipped = collections.Counter()
+              MAXTRY, WAIT = int(ENV("REPAIR_TRIES", "4")), int(ENV("REPAIR_WAIT_DAYS", "6"))
               reset = {x.strip().lower() for x in ENV("RESET", "").split(",") if x.strip()}
               for r in sel:                                                        # RESET = start these instruments again from scratch (wrong data found)
                   if r["id"] in reset:
@@ -140,11 +145,18 @@ jobs:
                   i = r["id"]; rs = real.get(i, {}); verdict = rs.get("verdict", "")
                   start = rs.get("real_first_day", "") if verdict in ("OK_CONFIRMED", "M1_FOUND") and rs.get("best_timeframe", "m1") == "m1" else ""
                   row = index.get(i)
-                  if row and (row.get("status") == "SUSPECT_SCALE" or (row.get("status") in ("COMPLETE", "NO_DATA") and row.get("checked_through", "") >= str(y))): continue
+                  if row and row.get("status") == "SUSPECT_SCALE": continue
+                  rep = sorted({g["day"] for g in gapfile.get(i, []) if i not in reset and int(g.get("tries") or 0) < MAXTRY and (not g.get("last_try") or g["last_try"] <= str(TODAY() - datetime.timedelta(days=WAIT)))
+                                and (g["what"].startswith("ONLY") or datetime.date.fromisoformat(g["day"]).weekday() < 5)})
+                  finished = bool(row and row.get("status") in ("COMPLETE", "NO_DATA") and row.get("checked_through", "") >= str(y))
+                  if finished and not rep: continue
                   item = {"id": i, "category": r["category"], "tag": r["release_tag"], "name": r["name"], "start": start, "df": scale.get(i, ""),
                           "checked_through": (row or {}).get("checked_through", ""), "days": int(r["days"]) if r["days"] else 0}
+                  if rep: item["repair"] = rep
+                  if finished: item["days"] = len(rep)                              # only repair work
                   if not start: item["problem"] = "START_UNKNOWN"
                   elif not item["df"]: item["problem"] = "NO_SCALE"
+                  if "problem" in item: item.pop("repair", None)
                   todo.append(item)
               work = [t for t in todo if "problem" not in t]; probs = [t for t in todo if "problem" in t]
               k = max(1, min(nsh, len(work))); loads = [0] * k; shards = [[] for _ in range(k)]
@@ -157,7 +169,8 @@ jobs:
               json.dump({"shards": shards, "yesterday": str(y), "category": cat}, open("plan_out/todo.json", "w"))
               cnt = collections.Counter(t["category"] for t in work)
               lines = [f"### Plan ({NOW():%Y-%m-%d %H:%M} UTC)", f"category input: {cat} | instruments with work: {len(work)} | problems (no request possible): {len(probs)} | shards used: {k}",
-                       "per category: " + ", ".join(f"{c} {cnt[c]}" for c in cats if cnt[c]), f"estimated requests (every day x 2 sides, upper bound): {sum(t['days'] * 2 for t in work):,}"]
+                       "per category: " + ", ".join(f"{c} {cnt[c]}" for c in cats if cnt[c]), f"estimated requests (every day x 2 sides, upper bound): {sum(t['days'] * 2 for t in work):,}",
+                       f"gap days to re-check (repair): {sum(len(t.get('repair', [])) for t in work):,} in {sum(1 for t in work if t.get('repair'))} instruments"]
               if probs: lines.append("problems: " + ", ".join(f"{t['id']}:{t['problem']}" for t in probs[:30]))
               print("\n".join(lines)); summary("\n".join(lines))
               out = ENV("GITHUB_OUTPUT")
@@ -337,7 +350,7 @@ jobs:
 
           def shard():
               sh_i = int(ENV("SHARD", "0")); todo = json.load(open("todo.json")); y = datetime.date.fromisoformat(todo["yesterday"]); mine = todo["shards"][sh_i]
-              os.makedirs(WORK, exist_ok=True); parts, gaps, notes = [], [], []
+              os.makedirs(WORK, exist_ok=True); parts, gaps, notes, repairs = [], [], [], []
               print(f"shard {sh_i}: {len(mine)} instruments, budget {ENV('BUDGET_HOURS', '5.3')} h, workers {WORKERS}", flush=True)
               for inst in mine:
                   i = inst["id"]; row = {"symbol": i, "category": inst["category"], "release": inst["tag"], "updated_utc": f"{NOW():%Y-%m-%d %H:%M}", "added_rows": 0, "source": ""}
@@ -407,6 +420,21 @@ jobs:
                       try: flush(final=True)
                       except Exception as e: failed = True; notes.append(f"{i}: upload/pack failed: {str(e)[:100]}")
                   if failed: checked = safe_checked; nxt = checked + datetime.timedelta(days=1); gaps[:] = [g for g in gaps if g["symbol"] != i or g["day"] <= str(checked)]; row["note"] = "upload failed - will retry next run"
+                  if inst.get("repair") and not failed and not suspect and time.time() < DEADLINE and not S["stop"]:
+                      try:
+                          days = [datetime.date.fromisoformat(x) for x in inst["repair"]]; rrows = []; fixed = []; still = {}
+                          res, _ = old_days(i, days, df, dec); srcs.add("old")
+                          for d in days:
+                              if (d, "BID") not in res or (d, "ASK") not in res: continue          # not answered = no new information, no 'try' counted
+                              b, a = res[(d, "BID")], res[(d, "ASK")]
+                              if b is not None and a is not None and set(b) & set(a): rrows += mk_rows(d, b, a); fixed.append(d)
+                              else: still[d] = "NO_DATA_BOTH_SIDES" if b is None and a is None else ("ONLY_BID" if a is None else "ONLY_ASK")
+                          if rrows:
+                              blob, merged = pack_merge(ex, rrows); safe_upload(inst["tag"], base, blob); ex = merged; total_added += len(rrows)
+                          for d in fixed: repairs.append({"symbol": i, "day": str(d), "result": "FIXED", "what": ""})
+                          for d, w in still.items(): repairs.append({"symbol": i, "day": str(d), "result": "STILL", "what": w})
+                          notes.append(f"{i}: repair - {len(fixed)} gap days filled, {len(still)} still without data, {len(days) - len(fixed) - len(still)} not answered"); print(notes[-1], flush=True)
+                      except Exception as e: notes.append(f"{i}: repair failed: {str(e)[:100]}"); print(notes[-1], flush=True)
                   st = "COMPLETE" if nxt > y else "PARTIAL"
                   if ex is None and st == "COMPLETE": st = "NO_DATA"
                   if suspect: st = "SUSPECT_SCALE"; row["note"] = "price jumped >4x between blocks - check scale; not stored from there"
@@ -417,7 +445,7 @@ jobs:
                              source="+".join(sorted(srcs)) if srcs else "", nodata_weekdays=nodata_wd, added_rows=total_added)
                   parts.append(row); print(f"== {i}: {st}, added {total_added:,} rows, checked through {checked}", flush=True)
               os.makedirs("part_out", exist_ok=True)
-              for name, rows, cols in (("index_part", parts, IDX_COLS), ("gaps_part", gaps, ["symbol", "day", "what"])):
+              for name, rows, cols in (("index_part", parts, IDX_COLS), ("gaps_part", gaps, ["symbol", "day", "what"]), ("repair_part", repairs, ["symbol", "day", "result", "what"])):
                   with open(f"part_out/{name}_{sh_i}.csv", "w", newline="", encoding="utf-8") as f:
                       w = csv.DictWriter(f, fieldnames=cols, restval=""); w.writeheader(); w.writerows(rows)
               el = time.time() - S["t0"]
@@ -429,11 +457,12 @@ jobs:
           # ----------------------------------------------------------------------------------------------------------------------------- finalize
           def finalize():
               RESET = {x.strip().lower() for x in ENV("RESET", "").split(",") if x.strip()}
-              idx_new, gaps_new, logs = {}, [], []
+              idx_new, gaps_new, logs, reps_new = {}, [], [], []; nfixed = nstill = 0
               for r in sorted(os.listdir("parts")) if os.path.isdir("parts") else []:
                   p = os.path.join("parts", r)
                   if r.startswith("index_part"): idx_new.update({x["symbol"]: x for x in rd_csv(p)})
                   elif r.startswith("gaps_part"): gaps_new += rd_csv(p)
+                  elif r.startswith("repair_part"): reps_new += rd_csv(p)
                   elif r.startswith("log_"): logs.append(open(p).read().strip())
               tags = sorted(set(x["release"] for x in idx_new.values())); added = 0; partial = 0; per = collections.defaultdict(collections.Counter)
               for t in tags:
@@ -454,11 +483,18 @@ jobs:
                   for k in [k for k in g if k[0] in RESET and k[0] in idx_new]: del g[k]          # RESET: forget the old gap list of that instrument
                   for x in gaps_new:
                       if x["symbol"] in idx_new and idx_new[x["symbol"]]["release"] == t: g[(x["symbol"], x["day"], x["what"])] = x
+                  for x in reps_new:                                                       # repair results: FIXED = gone, STILL = one more try counted
+                      sym, dy = x["symbol"], x["day"]
+                      if sym not in idx_new or idx_new[sym]["release"] != t: continue
+                      olds = [k for k in g if k[0] == sym and k[1] == dy]; tries = max([int(g[k].get("tries") or 0) for k in olds] or [0])
+                      for k in olds: del g[k]
+                      if x["result"] == "FIXED": nfixed += 1
+                      else: nstill += 1; g[(sym, dy, x["what"])] = {"symbol": sym, "day": dy, "what": x["what"], "tries": tries + 1, "last_try": str(TODAY())}
                   with open("out/GAPS.csv", "w", newline="", encoding="utf-8") as f:
-                      w = csv.DictWriter(f, fieldnames=["symbol", "day", "what"]); w.writeheader(); [w.writerow(g[k]) for k in sorted(g)]
+                      w = csv.DictWriter(f, fieldnames=["symbol", "day", "what", "tries", "last_try"], restval=""); w.writeheader(); [w.writerow(g[k]) for k in sorted(g)]
                   gh("release", "upload", t, "out/INDEX.csv", "out/GAPS.csv", "--clobber")
               stopped = any("BLOCKED?" in l for l in logs)
-              lines = ["### Result of this run", f"rows added: {added:,} | instruments still PARTIAL after progress: {partial}"] + [f"{c}: {dict(v)}" for c, v in per.items()] + ["", *logs]
+              lines = ["### Result of this run", f"repair: {nfixed} gap days filled, {nstill} still without data (tries counted)", f"rows added: {added:,} | instruments still PARTIAL after progress: {partial}"] + [f"{c}: {dict(v)}" for c, v in per.items()] + ["", *logs]
               if stopped: lines.append("A shard saw 12 refusals in a row (403/429): NO new run will be started automatically. Look at the log before running again.")
               print("\n".join(lines)); summary("\n".join(["```"] + lines + ["```"]))
               again = (partial > 0 and not stopped and int(ENV("CHAIN_LEFT", "0")) > 0)
